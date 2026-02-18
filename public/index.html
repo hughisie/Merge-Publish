@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>News Merger & Publisher</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;700&family=Work+Sans:wght@400;500;600;700&display=swap"
+    rel="stylesheet">
+</head>
+
+<body>
+  <div class="noise-overlay"></div>
+
+  <header>
+    <div class="brand">
+      <svg viewBox="0 0 24 24">
+        <path d="M19 5v14H5V5h14m0-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" />
+        <path d="M14 17H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z" />
+      </svg>
+      News Merger <span>&amp;</span> Publisher
+    </div>
+    <div id="status-indicator" style="font-size: 0.85rem; color: var(--text-secondary);">Ready</div>
+  </header>
+
+  <div class="container">
+    <div class="steps-indicator">
+      <div class="step-dot active" id="dot-1"><span>01 Load</span></div>
+      <div class="step-dot" id="dot-2"><span>02 Review</span></div>
+      <div class="step-dot" id="dot-3"><span>03 Select</span></div>
+      <div class="step-dot" id="dot-4"><span>04 Generate</span></div>
+    </div>
+
+    <!-- STEP 1: Directory Selection -->
+    <div id="step-1" class="wizard-step active">
+      <h1>Select News Source</h1>
+      <p>Enter the full path to the directory containing the scraped JSON news files.</p>
+
+      <div class="card">
+        <div class="input-group">
+          <label style="display:block; margin-bottom:0.5rem; font-weight:600;">Directory Path</label>
+          <div style="display:flex; gap:0.5rem;">
+            <input type="text" id="dir-path" placeholder="/Users/username/data/news/..." />
+            <button id="btn-browse" class="btn-secondary" title="Browse...">📂</button>
+            <input type="file" id="dir-picker" webkitdirectory directory multiple style="display:none;" />
+          </div>
+        </div>
+        <button id="btn-load-dir" class="btn-primary">
+          Load Articles
+        </button>
+
+        <div id="loading-progress-container" class="hidden" style="margin-top: 1rem;">
+          <div class="progress-bar-bg">
+            <div id="loading-progress" class="progress-bar-fill" style="width: 0%;"></div>
+          </div>
+          <p id="loading-status"
+            style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 0.5rem; text-align: center;">Reading
+            files...</p>
+        </div>
+      </div>
+
+      <div id="file-stats" class="hidden" style="margin-top: 1rem;"></div>
+    </div>
+
+    <!-- STEP 2: Clustering Review -->
+    <div id="step-2" class="wizard-step">
+      <h1>Review Stories</h1>
+      <p>We've grouped the articles into stories. Please review the clusters and uncheck any duplicates you don't want
+        to process.</p>
+
+      <div class="selection-actions">
+        <button type="button" class="btn-secondary" id="btn-select-all-clusters">✓ Select All</button>
+        <button type="button" class="btn-secondary" id="btn-select-none-clusters">✕ Select None</button>
+      </div>
+
+      <div id="clusters-container">
+        <!-- Clusters inserted here -->
+      </div>
+
+      <div class="actions floating-actions review-actions">
+        <button class="btn-secondary" onclick="app.prevStep()">Back</button>
+        <button class="btn-primary" id="btn-confirm-clusters">
+          Confirm <span>&rarr;</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- STEP 3: Headline Selection -->
+    <div id="step-3" class="wizard-step">
+      <h1>Select for Publication</h1>
+      <p>Review the English headlines and select which stories to write and publish to Barna.News.</p>
+
+      <div class="selection-actions">
+        <button type="button" class="btn-secondary" id="btn-select-all-headlines">✓ Select All</button>
+        <button type="button" class="btn-secondary" id="btn-select-none-headlines">✕ Select None</button>
+      </div>
+
+      <div id="headlines-container">
+        <!-- Headlines check list inserted here -->
+      </div>
+
+      <div class="actions">
+        <button class="btn-secondary" onclick="app.prevStep()">Back</button>
+        <button class="btn-primary" id="btn-start-writing">
+          Generate Articles <span>&rarr;</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- STEP 4: Generation & Review -->
+    <div id="step-4" class="wizard-step">
+      <h1>Generating Articles</h1>
+      <p>Writing articles with Gemini, inserting links, and searching for images...</p>
+
+      <div class="generation-summary">
+        <div id="generation-overall-label">Ready to generate.</div>
+        <div id="generation-timer">00:00</div>
+      </div>
+      <div class="progress-bar-bg generation-overall-progress">
+        <div id="generation-overall-progress" class="progress-bar-fill" style="width: 0%;"></div>
+      </div>
+
+      <div id="generation-progress"></div>
+
+      <div id="preview-container"></div>
+
+      <div class="actions">
+        <button class="btn-secondary" onclick="app.prevStep()">Back</button>
+        <button class="btn-primary" id="btn-publish-all" disabled>
+          Publish Drafts to WordPress
+        </button>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+
+</html>

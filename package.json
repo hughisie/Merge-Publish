@@ -1,0 +1,22 @@
+{
+  "name": "news-merger-publisher",
+  "version": "1.0.0",
+  "description": "Merge JSON news articles and publish to WordPress",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon server/index.js",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "form-data": "^4.0.1",
+    "node-fetch": "^3.3.2",
+    "sharp": "^0.33.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
