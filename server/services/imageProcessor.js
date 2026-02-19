@@ -67,7 +67,7 @@ async function detectBanners(imageBuffer) {
  * - Convert to optimized JPEG
  * - Return the best image (largest, best aspect ratio)
  */
-export async function processImages(imageUrls) {
+export async function processImages(imageUrls, { scoreImage } = {}) {
     if (!imageUrls || imageUrls.length === 0) return null;
 
     const processed = [];
@@ -128,15 +128,46 @@ export async function processImages(imageUrls) {
     if (processed.length === 0) return null;
 
     // Prefer landscape images with good resolution
-    processed.sort((a, b) => {
-        // Prefer 16:9-ish aspect ratios
+    const technicalRank = (image) => {
         const idealRatio = 16 / 9;
-        const aDiff = Math.abs(a.aspectRatio - idealRatio);
-        const bDiff = Math.abs(b.aspectRatio - idealRatio);
-        if (Math.abs(aDiff - bDiff) > 0.3) return aDiff - bDiff;
-        // Then prefer larger
-        return (b.width * b.height) - (a.width * a.height);
+        const ratioPenalty = Math.abs(image.aspectRatio - idealRatio);
+        const area = image.width * image.height;
+        return area - (ratioPenalty * 100000);
+    };
+
+    processed.forEach(image => {
+        image.technicalScore = technicalRank(image);
+        image.relevanceScore = null;
     });
 
-    return processed[0];
+    if (typeof scoreImage === 'function') {
+        for (const image of processed) {
+            try {
+                const score = await scoreImage(image);
+                image.relevanceScore = Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : null;
+            } catch (err) {
+                console.warn(`  ⚠️  Failed to score image relevance ${image.originalUrl}: ${err.message}`);
+            }
+        }
+    }
+
+    processed.sort((a, b) => {
+        const aScore = Number.isFinite(a.relevanceScore) ? a.relevanceScore : -1;
+        const bScore = Number.isFinite(b.relevanceScore) ? b.relevanceScore : -1;
+        if (aScore !== bScore) return bScore - aScore;
+        return b.technicalScore - a.technicalScore;
+    });
+
+    const selected = processed[0];
+    selected.candidates = processed.map(candidate => ({
+        originalUrl: candidate.originalUrl,
+        width: candidate.width,
+        height: candidate.height,
+        aspectRatio: candidate.aspectRatio,
+        technicalScore: candidate.technicalScore,
+        relevanceScore: candidate.relevanceScore,
+        selected: candidate.originalUrl === selected.originalUrl,
+    }));
+
+    return selected;
 }

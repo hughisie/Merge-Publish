@@ -21,15 +21,21 @@
       </svg>
       News Merger <span>&amp;</span> Publisher
     </div>
-    <div id="status-indicator" style="font-size: 0.85rem; color: var(--text-secondary);">Ready</div>
+    <div class="header-controls">
+      <div id="status-indicator" style="font-size: 0.85rem; color: var(--text-secondary);">Ready</div>
+      <label class="admin-toggle" for="toggle-admin-mode">
+        <input type="checkbox" id="toggle-admin-mode" />
+        <span>Admin Mode</span>
+      </label>
+    </div>
   </header>
 
   <div class="container">
     <div class="steps-indicator">
       <div class="step-dot active" id="dot-1"><span>01 Load</span></div>
       <div class="step-dot" id="dot-2"><span>02 Review</span></div>
-      <div class="step-dot" id="dot-3"><span>03 Select</span></div>
-      <div class="step-dot" id="dot-4"><span>04 Generate</span></div>
+      <div class="step-dot" id="dot-3"><span>03 Generate</span></div>
+      <div class="step-dot" id="dot-4"><span>04 Social</span></div>
     </div>
 
     <!-- STEP 1: Directory Selection -->
@@ -61,6 +67,13 @@
       </div>
 
       <div id="file-stats" class="hidden" style="margin-top: 1rem;"></div>
+
+      <div id="pipeline-overview" class="card hidden" style="margin-top: 1rem;">
+        <p id="pipeline-stage-label" style="margin:0 0 0.5rem 0; color: var(--text-secondary);">Waiting to start...</p>
+        <div class="progress-bar-bg">
+          <div id="pipeline-progress" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+      </div>
     </div>
 
     <!-- STEP 2: Clustering Review -->
@@ -74,42 +87,57 @@
         <button type="button" class="btn-secondary" id="btn-select-none-clusters">✕ Select None</button>
       </div>
 
+      <div class="selection-actions type-actions">
+        <details class="type-filter-menu">
+          <summary id="filter-story-type-label" class="btn-secondary">All Types</summary>
+          <div class="type-filter-options" id="filter-story-type-options">
+            <label><input type="checkbox" class="type-filter-check" value="news" checked> News</label>
+            <label><input type="checkbox" class="type-filter-check" value="feature" checked> Feature</label>
+            <label><input type="checkbox" class="type-filter-check" value="interview" checked> Interview</label>
+            <label><input type="checkbox" class="type-filter-check" value="opinion" checked> Opinion</label>
+            <label><input type="checkbox" class="type-filter-check" value="review" checked> Review</label>
+            <label><input type="checkbox" class="type-filter-check" value="recommendation" checked> Recommendation</label>
+            <label><input type="checkbox" class="type-filter-check" value="whats_on" checked> What's On</label>
+            <label><input type="checkbox" class="type-filter-check" value="history" checked> History</label>
+            <label><input type="checkbox" class="type-filter-check" value="other" checked> Other</label>
+          </div>
+        </details>
+        <select id="sort-story-clusters" class="btn-secondary">
+          <option value="date_desc">Sort: Latest</option>
+          <option value="date_asc">Sort: Oldest</option>
+          <option value="type">Sort: Type</option>
+          <option value="sources_desc">Sort: Most Sources</option>
+        </select>
+        <select id="select-story-type" class="btn-secondary">
+          <option value="news">Select News</option>
+          <option value="feature">Select Feature</option>
+          <option value="interview">Select Interview</option>
+          <option value="opinion">Select Opinion</option>
+          <option value="review">Select Review</option>
+          <option value="recommendation">Select Recommendation</option>
+          <option value="whats_on">Select What's On</option>
+          <option value="history">Select History</option>
+          <option value="other">Select Other</option>
+        </select>
+        <button type="button" class="btn-secondary" id="btn-select-clusters-by-type">Select by Type</button>
+        <button type="button" class="btn-secondary admin-only hidden" id="btn-force-merge-clusters">Force Merge Selected</button>
+      </div>
+
       <div id="clusters-container">
         <!-- Clusters inserted here -->
       </div>
 
       <div class="actions floating-actions review-actions">
+        <div id="step2-selection-count" class="selection-count">Selected 0 of 0</div>
         <button class="btn-secondary" onclick="app.prevStep()">Back</button>
         <button class="btn-primary" id="btn-confirm-clusters">
-          Confirm <span>&rarr;</span>
-        </button>
-      </div>
-    </div>
-
-    <!-- STEP 3: Headline Selection -->
-    <div id="step-3" class="wizard-step">
-      <h1>Select for Publication</h1>
-      <p>Review the English headlines and select which stories to write and publish to Barna.News.</p>
-
-      <div class="selection-actions">
-        <button type="button" class="btn-secondary" id="btn-select-all-headlines">✓ Select All</button>
-        <button type="button" class="btn-secondary" id="btn-select-none-headlines">✕ Select None</button>
-      </div>
-
-      <div id="headlines-container">
-        <!-- Headlines check list inserted here -->
-      </div>
-
-      <div class="actions">
-        <button class="btn-secondary" onclick="app.prevStep()">Back</button>
-        <button class="btn-primary" id="btn-start-writing">
           Generate Articles <span>&rarr;</span>
         </button>
       </div>
     </div>
 
-    <!-- STEP 4: Generation & Review -->
-    <div id="step-4" class="wizard-step">
+    <!-- STEP 3: Generation & Review -->
+    <div id="step-3" class="wizard-step">
       <h1>Generating Articles</h1>
       <p>Writing articles with Gemini, inserting links, and searching for images...</p>
 
@@ -121,16 +149,71 @@
         <div id="generation-overall-progress" class="progress-bar-fill" style="width: 0%;"></div>
       </div>
 
+      <div class="generation-summary generation-metrics-row">
+        <div id="generation-eta">ETA --:--</div>
+        <div id="generation-speed">Avg -- s/item</div>
+        <button type="button" class="btn-secondary" id="btn-retry-failed" disabled>Retry failed only</button>
+      </div>
+
       <div id="generation-progress"></div>
 
+      <div class="generation-summary" style="margin-top:1rem;">
+        <div id="publish-overall-label">Ready to publish.</div>
+        <div id="publish-eta">ETA --:--</div>
+      </div>
+      <div class="progress-bar-bg generation-overall-progress">
+        <div id="publish-overall-progress" class="progress-bar-fill" style="width: 0%;"></div>
+      </div>
+
       <div id="preview-container"></div>
+
+      <div id="admin-log-panel" class="card admin-only hidden">
+        <div class="admin-log-head">
+          <h3 style="margin:0;">Admin Log</h3>
+          <button type="button" id="btn-download-logs" class="btn-secondary">Download Logs</button>
+        </div>
+        <div id="usage-summary" class="usage-summary">API calls 0 · In 0 tok · Out 0 tok · Est $0.0000</div>
+        <div id="admin-log-list" class="admin-log-list"></div>
+      </div>
 
       <div class="actions">
         <button class="btn-secondary" onclick="app.prevStep()">Back</button>
         <button class="btn-primary" id="btn-publish-all" disabled>
           Publish Drafts to WordPress
         </button>
+        <button class="btn-secondary" id="btn-open-social">
+          Open Social Composer
+        </button>
       </div>
+    </div>
+
+    <!-- STEP 4: Social Post Composer -->
+    <div id="step-4" class="wizard-step">
+      <h1>Social Post Composer</h1>
+      <p>Review recently published and draft posts from WordPress, then generate ready-to-use Reddit, X, and WhatsApp HTML outputs.</p>
+
+      <div class="selection-actions">
+        <button type="button" class="btn-secondary" id="btn-load-recent-posts">Load Recent WordPress Posts</button>
+        <button type="button" class="btn-secondary" id="btn-select-all-social">Select All</button>
+        <button type="button" class="btn-secondary" id="btn-select-none-social">Select None</button>
+      </div>
+
+      <div class="card">
+        <label for="social-output-dir" style="display:block; margin-bottom:0.4rem; font-weight:600;">Social HTML output folder (absolute path)</label>
+        <input type="text" id="social-output-dir" placeholder="/absolute/path/to/output" />
+      </div>
+
+      <div id="recent-posts-container"></div>
+
+      <div class="actions">
+        <div id="social-selection-count" class="selection-count">Selected 0 posts</div>
+        <button class="btn-secondary" onclick="app.prevStep()">Back</button>
+        <button class="btn-primary" id="btn-generate-social-files" disabled>
+          Generate Social HTML Files
+        </button>
+      </div>
+
+      <div id="social-files-result" class="card hidden"></div>
     </div>
 
   </div>
