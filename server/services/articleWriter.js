@@ -1,5 +1,6 @@
-import { researchWithGrounding, generateWithFlash, generateWithPro } from './llmClient.js';
+import { researchWithGrounding, researchWithGroundingPreferred25, generateWithFlash, generateWithPro } from './llmClient.js';
 import { findRelatedArticles } from './relatedArticles.js';
+import fetch from 'node-fetch';
 
 // WhatsApp broadcast channel banner to insert after first paragraph
 const WHATSAPP_BANNER = `
@@ -139,13 +140,13 @@ function enforceOutboundLinkPolicy(html = '') {
         if (relMatch) rel = relMatch[2];
 
         const fullHint = `${href} ${attrs}`;
-        const requiredRel = ['noopener', 'noreferrer'];
+        const requiredRel = ['noopener', 'noreferrer', 'nofollow'];
         if (SPONSORED_HINTS.some((pattern) => pattern.test(fullHint))) {
-            requiredRel.push('sponsored', 'nofollow');
+            requiredRel.push('sponsored');
         } else if (UGC_DOMAINS.test(href)) {
-            requiredRel.push('ugc', 'nofollow');
+            requiredRel.push('ugc');
         } else if (LOW_TRUST_HINTS.some((pattern) => pattern.test(fullHint))) {
-            requiredRel.push('nofollow');
+            requiredRel.push('ugc');
         }
 
         const nextRel = mergeRel(rel, requiredRel);
@@ -153,22 +154,22 @@ function enforceOutboundLinkPolicy(html = '') {
         if (/\brel=(['"]).*?\1/i.test(rebuilt)) {
             rebuilt = rebuilt.replace(/\brel=(['"]).*?\1/i, `rel=${quote}${nextRel}${quote}`);
         } else {
-            rebuilt = rebuilt.replace('<a', `<a rel=${quote}${nextRel}${quote}`);
+            rebuilt = rebuilt.replace('<a', `<a rel=${quote}${nextRel}${quote} `);
         }
         if (!/\btarget=(['"]).*?\1/i.test(rebuilt)) {
-            rebuilt = rebuilt.replace('<a', `<a target=${quote}_blank${quote}`);
+            rebuilt = rebuilt.replace('<a', `<a target=${quote}_blank${quote} `);
         }
-        return rebuilt;
+        return rebuilt.replace(/ +>/g, '>');
     });
 }
 
-function ensurePrimarySourceLink(html = '', cluster = {}) {
-    const primarySource = selectPrimarySourceUrl(cluster);
+function ensurePrimarySourceLink(html = '', cluster = {}, research = {}) {
+    const primarySource = selectPrimarySourceUrl(cluster, research);
     if (!primarySource) return html;
     if (html.includes(primarySource)) return html;
 
     const sourceName = cluster?.sources?.find((item) => item?.url === primarySource)?.name || 'primary source';
-    return `${html}\n<p><em>According to the official source, see <a href="${primarySource}" target="_blank" rel="noopener noreferrer">${sourceName}</a>.</em></p>`;
+    return `${html}\n<p><em>According to the official source, see <a href="${primarySource}" target="_blank" rel="noopener noreferrer" data-protected="true">${sourceName}</a>.</em></p>`;
 }
 
 function sanitizeJsonText(text = '') {
@@ -261,11 +262,272 @@ async function parseModelJsonWithRepair(rawText, schemaHint) {
     }
 }
 
+function decodeHtmlEntities(text = '') {
+    return String(text || '')
+        .replace(/&amp;/gi, '&')
+        .replace(/&#x2F;/gi, '/')
+        .replace(/&#47;/gi, '/')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .trim();
+}
+
+function isLikelyHttpUrl(url = '') {
+    const raw = decodeHtmlEntities(url);
+    if (!/^https?:\/\//i.test(raw)) return false;
+    try {
+        const parsed = new URL(raw);
+        return Boolean(parsed.hostname && parsed.hostname.includes('.'));
+    } catch {
+        return false;
+    }
+}
+
+function stripAnchorTag(anchorHtml = '') {
+    return String(anchorHtml || '').replace(/<\/?a\b[^>]*>/gi, '');
+}
+
+function enforceOneLinkPerParagraph(html = '') {
+    return String(html || '').replace(/<p\b[^>]*>[\s\S]*?<\/p>/gi, (paragraph) => {
+        let seen = false;
+        return paragraph.replace(/<a\b[\s\S]*?<\/a>/gi, (anchor) => {
+            if (!seen) {
+                seen = true;
+                return anchor;
+            }
+            return stripAnchorTag(anchor);
+        });
+    });
+}
+
+function countAnchors(html = '') {
+    const allMatches = html.match(/<a\b[^>]*href=(['"])(https?:\/\/[^'"\s>]+)\1[^>]*>[\s\S]*?<\/a>/gi) || [];
+    return allMatches.filter(m => !m.includes('data-protected="true"') && !m.includes('bnn-amazon-deals')).length;
+}
+
+function trimAnchorsToMax(html = '', maxLinks = 4) {
+    let out = String(html || '');
+    const allMatches = [...out.matchAll(/<a\b[^>]*href=(['"])(https?:\/\/[^'"\s>]+)\1[^>]*>[\s\S]*?<\/a>/gi)];
+    const unprotectedMatches = allMatches.filter(m => !m[0].includes('data-protected="true"') && !m[0].includes('bnn-amazon-deals'));
+
+    if (unprotectedMatches.length <= maxLinks) return out;
+
+    for (let i = unprotectedMatches.length - 1; i >= maxLinks; i -= 1) {
+        const raw = unprotectedMatches[i]?.[0] || '';
+        if (!raw) continue;
+        out = out.replace(raw, stripAnchorTag(raw));
+    }
+    return out;
+}
+
+function collectLinkCandidates({ research = {}, relatedArticles = [] } = {}) {
+    const seen = new Set();
+    const items = [];
+
+    const push = (title, url, type) => {
+        const cleanUrl = decodeHtmlEntities(url || '');
+        const cleanTitle = String(title || '').replace(/<[^>]+>/g, '').trim();
+        if (!cleanTitle || !isLikelyHttpUrl(cleanUrl)) return;
+        if (seen.has(cleanUrl)) return;
+        seen.add(cleanUrl);
+        items.push({ title: cleanTitle, url: cleanUrl, type });
+    };
+
+    (relatedArticles || []).forEach((item) => push(item?.title, item?.link, 'internal'));
+    (research?.event_links || []).forEach((item) => push(item?.title, item?.url, 'external'));
+    (research?.government_links || []).forEach((item) => push(item?.title, item?.url, 'external'));
+    (research?.wikipedia_links || []).forEach((item) => push(item?.title, item?.url, 'external'));
+    (research?.other_links || []).forEach((item) => push(item?.title, item?.url, 'external'));
+
+    return items;
+}
+
+async function checkUrlReachable(url = '') {
+    if (!isLikelyHttpUrl(url)) return false;
+    try {
+        const res = await fetch(url, { method: 'HEAD', timeout: 8000, redirect: 'follow' });
+        if (res.ok) return true;
+        if ([405, 501].includes(res.status)) {
+            const fallback = await fetch(url, { method: 'GET', timeout: 10000, redirect: 'follow' });
+            return fallback.ok;
+        }
+        return false;
+    } catch {
+        return false;
+    }
+}
+
+async function repairUrlWithGroundedSearch({ brokenUrl = '', anchorText = '', context = '' } = {}) {
+    const prompt = `Find the best replacement URL for a broken or malformed reference link in a Barna.News article.
+
+Broken URL: ${JSON.stringify(String(brokenUrl || ''))}
+Anchor text: ${JSON.stringify(String(anchorText || ''))}
+Article context: ${JSON.stringify(String(context || '').slice(0, 1200))}
+
+Return JSON only:
+{
+  "fixed_url": "https://...",
+  "confidence": 0.0,
+  "reason": "short string"
+}`;
+
+    try {
+        const { text, searchResults } = await researchWithGroundingPreferred25(prompt, { stage: 'link_repair_grounded' });
+        const schemaHint = `{"fixed_url":"string","confidence":0.0,"reason":"string"}`;
+        const parsed = await parseModelJsonWithRepair(text, schemaHint);
+        const candidate = decodeHtmlEntities(parsed?.fixed_url || '');
+        const confidence = Number(parsed?.confidence);
+
+        if (isLikelyHttpUrl(candidate) && Number.isFinite(confidence) && confidence >= 0.45) {
+            return candidate;
+        }
+
+        const fallback = (Array.isArray(searchResults) ? searchResults : [])
+            .map((item) => decodeHtmlEntities(item?.url || ''))
+            .find((url) => isLikelyHttpUrl(url));
+        return fallback || '';
+    } catch {
+        return '';
+    }
+}
+
+async function repairAndNormalizeAnchors(html = '', { context = '' } = {}) {
+    const input = String(html || '');
+    const anchorPattern = /<a\b([^>]*?)href=(['"])([^'"\s>]+)\2([^>]*)>([\s\S]*?)<\/a>/gi;
+    const matches = [...input.matchAll(anchorPattern)];
+    if (!matches.length) return input;
+
+    const replacementMap = new Map();
+    for (const match of matches) {
+        const hrefRaw = decodeHtmlEntities(match[3] || '');
+        const anchorText = stripAnchorTag(match[0] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+        if (replacementMap.has(hrefRaw)) continue;
+
+        let fixedUrl = hrefRaw;
+        if (!isLikelyHttpUrl(fixedUrl) || !(await checkUrlReachable(fixedUrl))) {
+            const repaired = await repairUrlWithGroundedSearch({
+                brokenUrl: fixedUrl,
+                anchorText,
+                context,
+            });
+            fixedUrl = repaired || '';
+        }
+
+        if (fixedUrl && (await checkUrlReachable(fixedUrl))) {
+            replacementMap.set(hrefRaw, fixedUrl);
+        } else {
+            replacementMap.set(hrefRaw, null);
+        }
+    }
+
+    return input.replace(anchorPattern, (full, before, quote, href, after, inner) => {
+        const normalizedHref = decodeHtmlEntities(href || '');
+        const replacement = replacementMap.get(normalizedHref);
+        if (replacement === null) {
+            return String(inner || '').trim() || stripAnchorTag(full);
+        }
+        if (!replacement) return full;
+        const attrs = `${before || ''}${after || ''}`;
+        return `<a${attrs}href=${quote}${replacement}${quote}>${inner}</a>`;
+    });
+}
+
+function ensureMinimumLinks(html = '', candidates = [], minimum = 3, maximum = 4) {
+    let out = String(html || '');
+    let count = countAnchors(out);
+    if (count >= minimum) return trimAnchorsToMax(out, maximum);
+
+    const existing = new Set((out.match(/https?:\/\/[^'"\s<]+/gi) || []).map((value) => decodeHtmlEntities(value)));
+    const queue = (Array.isArray(candidates) ? candidates : []).filter((item) => {
+        const url = decodeHtmlEntities(item?.url || '');
+        return isLikelyHttpUrl(url) && !existing.has(url);
+    });
+
+    const additions = [];
+    for (const item of queue) {
+        if (count >= minimum || count >= maximum) break;
+        const safeTitle = escapeHtml(String(item?.title || 'Related source'));
+        const safeUrl = decodeHtmlEntities(item?.url || '');
+        const isInternal = /https?:\/\/(?:www\.)?barna\.news\b/i.test(safeUrl);
+        const anchor = isInternal
+            ? `<a href="${safeUrl}">${safeTitle}</a>`
+            : `<a href="${safeUrl}" target="_blank" rel="nofollow noopener noreferrer">${safeTitle}</a>`;
+        additions.push(`<p>Further context: ${anchor}.</p>`);
+        existing.add(safeUrl);
+        count += 1;
+    }
+
+    if (additions.length) {
+        out = `${out}\n\n<h2>Further Resources</h2>\n${additions.join('\n')}`;
+    }
+    return trimAnchorsToMax(out, maximum);
+}
+
+async function enforceArticleLinkPolicy(html = '', { relatedArticles = [], research = {}, context = '' } = {}) {
+    let out = String(html || '');
+    out = await repairAndNormalizeAnchors(out, { context });
+    out = enforceOneLinkPerParagraph(out);
+    out = enforceOutboundLinkPolicy(out);
+    out = trimAnchorsToMax(out, 4);
+    out = ensureMinimumLinks(out, collectLinkCandidates({ research, relatedArticles }), 3, 4);
+    out = enforceOutboundLinkPolicy(out);
+    return out;
+}
+
 function countWords(text = '') {
     return String(text || '').trim().split(/\s+/).filter(Boolean).length;
 }
 
-function limitQuoteDensity(html = '', wordsPerQuote = 300) {
+function escapeHtml(text = '') {
+    return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function stripRelatedReadingSection(html = '') {
+    const input = String(html || '');
+    const headingPattern = /<(h2|h3|p)[^>]*>\s*(?:<strong>)?\s*Related Reading on Barna\.News\s*(?:<\/strong>)?\s*<\/\1>/i;
+    const match = input.match(headingPattern);
+    if (!match || typeof match.index !== 'number') return input;
+
+    const start = match.index;
+    const afterHeading = start + match[0].length;
+    const rest = input.slice(afterHeading);
+    const nextSectionMatch = rest.match(/<(h2|h3)[^>]*>/i);
+    const end = nextSectionMatch && typeof nextSectionMatch.index === 'number'
+        ? afterHeading + nextSectionMatch.index
+        : input.length;
+    return `${input.slice(0, start)}${input.slice(end)}`.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function ensureRelatedReadingSection(html = '', relatedArticles = []) {
+    const normalized = stripRelatedReadingSection(html);
+    const safeRelated = (Array.isArray(relatedArticles) ? relatedArticles : [])
+        .filter((item) => /^https?:\/\//i.test(String(item?.link || '')))
+        .map((item) => ({
+            title: String(item?.title || '').replace(/<[^>]+>/g, '').trim(),
+            link: String(item?.link || '').trim(),
+        }))
+        .filter((item) => item.title && item.link)
+        .slice(0, 5);
+
+    if (!safeRelated.length) return normalized;
+
+    const relatedHtml = [
+        '<h2>Related Reading on Barna.News</h2>',
+        '<ul>',
+        ...safeRelated.map((item) => `  <li><a href="${item.link}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.title)}</a></li>`),
+        '</ul>',
+    ].join('\n');
+
+    return normalized ? `${normalized}\n\n${relatedHtml}` : relatedHtml;
+}
+
+function limitQuoteDensity(html = '', wordsPerQuote = 350) {
     const input = String(html || '');
     const quoteMatches = [...input.matchAll(/<blockquote[\s\S]*?<\/blockquote>/gi)];
     if (!quoteMatches.length) return input;
@@ -288,11 +550,13 @@ function limitQuoteDensity(html = '', wordsPerQuote = 300) {
 }
 
 function selectPrimarySourceUrl(cluster = {}, research = {}) {
+    const aiPrimary = String(research?.primary_source?.url || '');
+    if (aiPrimary && isLikelyHttpUrl(aiPrimary)) return aiPrimary;
+
     const sourceCandidates = Array.isArray(cluster?.sources) ? cluster.sources.map((s) => s?.url).filter(Boolean) : [];
     const officialCandidates = [
         ...(Array.isArray(research?.event_links) ? research.event_links.map((l) => l?.url) : []),
         ...(Array.isArray(research?.government_links) ? research.government_links.map((l) => l?.url) : []),
-        String(research?.primary_source?.url || ''),
         ...sourceCandidates,
     ].filter(Boolean);
 
@@ -400,9 +664,9 @@ Research the following news story and find relevant, authoritative links to incl
 
 Story headline: ${cluster.headline}
 Story summary: ${cluster.summary}
-Keywords: ${cluster.keywords.join(', ')}
-Original content (in ${cluster.original_language}):
-${cluster.merged_content.substring(0, 3000)}
+Keywords: ${(cluster.keywords || []).join(', ')}
+Original content (in ${cluster.original_language || 'English'}):
+${String(cluster.merged_content || cluster.summary || '').substring(0, 3000)}
 
 Find and return:
 1. Relevant Wikipedia article URLs (English Wikipedia preferred)
@@ -476,8 +740,8 @@ async function writeArticle(cluster, research, relatedArticles) {
 STORY HEADLINE: ${cluster.headline}
 STORY SUMMARY: ${cluster.summary}
 
-SOURCE MATERIAL (in ${cluster.original_language}, from ${cluster.article_count} source(s)):
-${cluster.merged_content.substring(0, 8000)}
+SOURCE MATERIAL (in ${cluster.original_language || 'English'}, from ${cluster.article_count || 1} source(s)):
+${String(cluster.merged_content || cluster.summary || '').substring(0, 8000)}
 
 ORIGINAL SOURCES:
 ${sourcesSection}
@@ -496,9 +760,10 @@ WRITING GUIDELINES:
 2. The tone should be NEUTRAL and INFORMATIVE - not sensationalist, not robotic
 3. Structure: Lead paragraph → context → details → reactions/quotes → analysis/outlook
 4. Weave in researched links naturally as inline hyperlinks where they add value, and include context around links (e.g. "according to the court ruling", "in the official statement")
-5. Credit the original source(s) with links - e.g. "according to [El Periódico](url)"
-6. Prioritize primary source links where possible for reports/studies/statistics cited in the article, and avoid low-trust sources unless clearly marked as unverified
-6. Include a "Related Reading on Barna.News" section at the end with linked article titles (only if there are related articles)
+5. YOU MUST explicitly hyperlink ANY inline references to the RELATED BARNA.NEWS ARTICLES within the text (e.g. <a href="...">guide to Barcelona concerts</a>). DO NOT leave them as plain text.
+6. Credit the original source(s) with links - e.g. "according to [El Periódico](url)"
+7. Prioritize primary source links where possible for reports/studies/statistics cited in the article, and avoid low-trust sources unless clearly marked as unverified
+8. Include a "Related Reading on Barna.News" section at the end with linked article titles (only if there are related articles)
 7. Use HTML formatting (<p>, <blockquote>, <a>, <strong>, <em>, <ul>, <ol>, <li>)
 8. Make it comprehensive but not bloated - aim for 600-1000 words
 9. All quotes should be translated to English but attributed to the original speaker
@@ -556,8 +821,13 @@ export async function generateArticle(cluster) {
 
     article = ensureSeoFields(article, cluster);
     article.body_html = cleanupArticleBody(article.body_html || '');
-    article.body_html = enforceOutboundLinkPolicy(article.body_html || '');
-    article.body_html = limitQuoteDensity(article.body_html || '', 300);
+    article.body_html = ensureRelatedReadingSection(article.body_html || '', relatedArticles);
+    article.body_html = await enforceArticleLinkPolicy(article.body_html || '', {
+        relatedArticles,
+        research,
+        context: `${cluster.headline || ''}\n${cluster.summary || ''}`,
+    });
+    article.body_html = limitQuoteDensity(article.body_html || '', 350);
     const primarySourceCluster = {
         ...cluster,
         sources: [
@@ -568,8 +838,12 @@ export async function generateArticle(cluster) {
             ...(cluster.sources || []),
         ],
     };
-    article.body_html = ensurePrimarySourceLink(article.body_html || '', primarySourceCluster);
-    article.body_html = enforceOutboundLinkPolicy(article.body_html || '');
+    article.body_html = ensurePrimarySourceLink(article.body_html || '', primarySourceCluster, research);
+    article.body_html = await enforceArticleLinkPolicy(article.body_html || '', {
+        relatedArticles,
+        research,
+        context: `${cluster.headline || ''}\n${cluster.summary || ''}`,
+    });
 
     // Step 4: Insert WhatsApp banner after first paragraph
     if (article.body_html) {

@@ -38,13 +38,13 @@ function enforceOutboundLinkPolicy(html = '') {
         if (relMatch) rel = relMatch[2];
 
         const fullHint = `${href} ${attrs}`;
-        const requiredRel = ['noopener', 'noreferrer'];
+        const requiredRel = ['noopener', 'noreferrer', 'nofollow'];
         if (SPONSORED_HINTS.some((pattern) => pattern.test(fullHint))) {
-            requiredRel.push('sponsored', 'nofollow');
+            requiredRel.push('sponsored');
         } else if (UGC_DOMAINS.test(href)) {
-            requiredRel.push('ugc', 'nofollow');
+            requiredRel.push('ugc');
         } else if (LOW_TRUST_HINTS.some((pattern) => pattern.test(fullHint))) {
-            requiredRel.push('nofollow');
+            requiredRel.push('ugc');
         }
 
         const nextRel = mergeRel(rel, requiredRel);
@@ -52,13 +52,225 @@ function enforceOutboundLinkPolicy(html = '') {
         if (/\brel=(['"]).*?\1/i.test(rebuilt)) {
             rebuilt = rebuilt.replace(/\brel=(['"]).*?\1/i, `rel=${quote}${nextRel}${quote}`);
         } else {
-            rebuilt = rebuilt.replace('<a', `<a rel=${quote}${nextRel}${quote}`);
+            rebuilt = rebuilt.replace('<a', `<a rel=${quote}${nextRel}${quote} `);
         }
         if (!/\btarget=(['"]).*?\1/i.test(rebuilt)) {
-            rebuilt = rebuilt.replace('<a', `<a target=${quote}_blank${quote}`);
+            rebuilt = rebuilt.replace('<a', `<a target=${quote}_blank${quote} `);
         }
-        return rebuilt;
+        return rebuilt.replace(/ +>/g, '>');
     });
+}
+
+function stripAnchorTag(anchorHtml = '') {
+    return String(anchorHtml || '').replace(/<\/?a\b[^>]*>/gi, '');
+}
+
+function enforceOneLinkPerParagraph(html = '') {
+    return String(html || '').replace(/<p\b[^>]*>[\s\S]*?<\/p>/gi, (paragraph) => {
+        let seen = false;
+        return paragraph.replace(/<a\b[\s\S]*?<\/a>/gi, (anchor) => {
+            if (!seen) {
+                seen = true;
+                return anchor;
+            }
+            return stripAnchorTag(anchor);
+        });
+    });
+}
+
+function hardClampParagraphLinks(html = '') {
+    return String(html || '').replace(/<p\b[^>]*>[\s\S]*?<\/p>/gi, (paragraph) => {
+        const openings = [...paragraph.matchAll(/<a\b[^>]*>/gi)];
+        if (openings.length <= 1) return paragraph;
+
+        const firstOpen = openings[0];
+        const firstOpenIndex = Number(firstOpen?.index || 0);
+        const firstOpenRaw = String(firstOpen?.[0] || '');
+        const closeIndex = paragraph.indexOf('</a>', firstOpenIndex + firstOpenRaw.length);
+        if (closeIndex === -1) {
+            return paragraph.replace(/<\/?a\b[^>]*>/gi, '');
+        }
+
+        const preserved = paragraph.slice(0, closeIndex + 4);
+        const tail = paragraph.slice(closeIndex + 4).replace(/<\/?a\b[^>]*>/gi, '');
+        return `${preserved}${tail}`;
+    });
+}
+
+function countAnchors(html = '') {
+    const allMatches = html.match(/<a\b[^>]*href=(['"])(https?:\/\/[^'"\s>]+)\1[^>]*>[\s\S]*?<\/a>/gi) || [];
+    return allMatches.filter(m => !m.includes('data-protected="true"') && !m.includes('bnn-amazon-deals')).length;
+}
+
+function trimAnchorsToMax(html = '', maxLinks = 4) {
+    let out = String(html || '');
+    const allMatches = [...out.matchAll(/<a\b[^>]*href=(['"])(https?:\/\/[^'"\s>]+)\1[^>]*>[\s\S]*?<\/a>/gi)];
+    const unprotectedMatches = allMatches.filter(m => !m[0].includes('data-protected="true"') && !m[0].includes('bnn-amazon-deals'));
+
+    if (unprotectedMatches.length <= maxLinks) return out;
+
+    for (let i = unprotectedMatches.length - 1; i >= maxLinks; i -= 1) {
+        const raw = unprotectedMatches[i]?.[0] || '';
+        if (!raw) continue;
+        out = out.replace(raw, stripAnchorTag(raw));
+    }
+    return out;
+}
+
+function escapeHtml(text = '') {
+    return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+export function normalizeRelatedReadingSections(html = '', relatedArticles = []) {
+    const input = String(html || '');
+    const sectionPattern = /<(h2|h3|p)[^>]*>\s*(?:<strong>)?\s*(Related Reading on Barna\.News|Further Resources(?: and Related Reading)?)\s*(?:<\/strong>)?\s*<\/\1>[\s\S]*?(?=<(h2|h3)\b|$)/gi;
+    const stripped = input.replace(sectionPattern, '').replace(/<h2>\s*Related Reading on Barna\.News\s*<\/h2>\s*(?!<(ul|ol)\b)[\s\S]*?(?=<(h2|h3)\b|$)/gi, '');
+
+    const safeRelated = (Array.isArray(relatedArticles) ? relatedArticles : [])
+        .filter((item) => /^https?:\/\//i.test(String(item?.link || '')))
+        .map((item) => ({
+            title: decodeHtmlEntities(String(item?.title || '').replace(/<[^>]+>/g, '').trim()),
+            link: String(item?.link || '').trim(),
+        }))
+        .filter((item) => item.title && item.link)
+        .slice(0, 5);
+
+    if (!safeRelated.length) return stripped.replace(/\n{3,}/g, '\n\n').trim();
+
+    function decodeHtmlEntities(str) {
+        if (!str) return '';
+        return String(str)
+            .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(dec))
+            .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .replace(/&apos;/g, "'")
+            .replace(/&#8217;/g, "'")
+            .replace(/&#8216;/g, "'")
+            .replace(/&#8220;/g, '"')
+            .replace(/&#8221;/g, '"');
+    }
+
+    const section = [
+        '<h2>Related Reading on Barna.News</h2>',
+        '<ul>',
+        ...safeRelated.map((item) => `  <li><a href="${item.link}">${escapeHtml(decodeHtmlEntities(item.title))}</a></li>`),
+        '</ul>',
+    ].join('\n');
+
+    return `${stripped.replace(/\n{3,}/g, '\n\n').trim()}\n\n${section}`.trim();
+}
+
+function collectPublishLinkCandidates(article = {}) {
+    const seen = new Set();
+    const items = [];
+    const push = (title, url) => {
+        const cleanTitle = String(title || '').replace(/<[^>]+>/g, '').trim();
+        const cleanUrl = String(url || '').trim();
+        if (!cleanTitle || !/^https?:\/\//i.test(cleanUrl)) return;
+        if (seen.has(cleanUrl)) return;
+        seen.add(cleanUrl);
+        items.push({ title: cleanTitle, url: cleanUrl });
+    };
+
+    (article?.relatedArticles || []).forEach((item) => push(item?.title, item?.link));
+    (article?.research?.event_links || []).forEach((item) => push(item?.title, item?.url));
+    (article?.research?.government_links || []).forEach((item) => push(item?.title, item?.url));
+    (article?.research?.wikipedia_links || []).forEach((item) => push(item?.title, item?.url));
+    return items;
+}
+
+function ensureMinimumLinks(html = '', candidates = [], minimum = 3, maximum = 4) {
+    let out = String(html || '');
+    let count = countAnchors(out);
+    if (count >= minimum) return trimAnchorsToMax(out, maximum);
+
+    const existing = new Set((out.match(/https?:\/\/[^'"\s<]+/gi) || []).map((value) => String(value).trim()));
+    const additions = [];
+    for (const item of Array.isArray(candidates) ? candidates : []) {
+        if (count >= minimum || count >= maximum) break;
+        const safeUrl = String(item?.url || '').trim();
+        const safeTitle = escapeHtml(item?.title || 'Related source');
+        if (!safeUrl || existing.has(safeUrl)) continue;
+        additions.push(`<p>Further context: <a href="${safeUrl}" target="_blank" rel="nofollow noopener noreferrer" data-protected="true">${safeTitle}</a>.</p>`);
+        existing.add(safeUrl);
+        count += 1;
+    }
+
+    if (additions.length) {
+        out = `${out}\n\n<h2>Further Resources</h2>\n${additions.join('\n')}`;
+    }
+    return trimAnchorsToMax(out, maximum);
+}
+
+function enforcePublishBodyRules(html = '', article = {}) {
+    let out = String(html || '');
+    // Strip Related Reading so it doesn't count towards body link limits and isn't modified
+    const sectionPattern = /<(h2|h3|p)[^>]*>\s*(?:<strong>)?\s*(Related Reading on Barna\.News|Further Resources(?: and Related Reading)?)\s*(?:<\/strong>)?\s*<\/\1>[\s\S]*?(?=<(h2|h3)\b|$)/gi;
+    out = out.replace(sectionPattern, '').replace(/<h2>\s*Related Reading on Barna\.News\s*<\/h2>\s*(?!<(ul|ol)\b)[\s\S]*?(?=<(h2|h3)\b|$)/gi, '');
+
+    // Force strip any hallucinated Gutenberg comments from the LLM QA pass
+    out = out.replace(/<!--\s*\/?wp:[^\->]*-->/gi, '');
+
+    out = enforceOneLinkPerParagraph(out);
+    out = hardClampParagraphLinks(out);
+    out = enforceOutboundLinkPolicy(out);
+    out = trimAnchorsToMax(out, 4);
+    out = ensureMinimumLinks(out, collectPublishLinkCandidates(article), 3, 4);
+    out = enforceOneLinkPerParagraph(out);
+    out = hardClampParagraphLinks(out);
+    out = enforceOutboundLinkPolicy(out);
+
+    out = normalizeRelatedReadingSections(out, article?.relatedArticles || []);
+    out = out.replace(/\n{3,}/g, '\n\n').trim();
+    return out;
+}
+
+function validatePublishBodyRules(html = '') {
+    const textOriginal = String(html || '');
+    // Core body is the text without the related reading section
+    const sectionPattern = /<(h2|h3|p)[^>]*>\s*(?:<strong>)?\s*(Related Reading on Barna\.News|Further Resources(?: and Related Reading)?)\s*(?:<\/strong>)?\s*<\/\1>[\s\S]*?(?=<(h2|h3)\b|$)/gi;
+    const text = textOriginal.replace(sectionPattern, '').replace(/<h2>\s*Related Reading on Barna\.News\s*<\/h2>\s*(?!<(ul|ol)\b)[\s\S]*?(?=<(h2|h3)\b|$)/gi, '');
+
+    const linkCount = countAnchors(text);
+
+    // Check paragraphs individually to avoid cross-paragraph matching
+    const paragraphs = text.match(/<p\b[^>]*>[\s\S]*?<\/p>/gi) || [];
+    const paragraphViolations = paragraphs.filter(p => (p.match(/<a\b/gi) || []).length > 1).length;
+
+    const brokenQuoteBlocks = (text.match(/<blockquote\b[^>]*>(?![\s\S]*?<\/blockquote>)/gi) || []).length;
+
+    // Use (?!\s*<ul>) to prevent newline/whitespace from causing false positives
+    const relatedPlaintextLeak = /<h2>\s*Related Reading on Barna\.News\s*<\/h2>(?!\s*<ul>)/i.test(textOriginal);
+
+    return {
+        linkCount,
+        paragraphViolations,
+        brokenQuoteBlocks,
+        relatedPlaintextLeak,
+        valid: linkCount >= 2 && linkCount <= 4 && paragraphViolations === 0 && brokenQuoteBlocks === 0 && !relatedPlaintextLeak,
+    };
+}
+
+function buildImageAltText(article = {}) {
+    const base = String(article?.focus_keyphrase || '').trim();
+    const title = String(article?.title || '').trim();
+    let alt = base ? `${base} - ${title}` : title;
+    alt = alt.replace(/\s+/g, ' ').trim();
+    if (alt.length > 120) alt = alt.slice(0, 120).replace(/\s+\S*$/, '').trim();
+    if (alt.length < 70) {
+        const extension = String(article?.meta_description || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        alt = `${alt} ${extension}`.replace(/\s+/g, ' ').trim();
+        if (alt.length > 120) alt = alt.slice(0, 120).replace(/\s+\S*$/, '').trim();
+    }
+    return alt || 'Barcelona news image';
 }
 
 function ensureSentence(text = '') {
@@ -455,7 +667,7 @@ function countWords(text = '') {
     return String(text || '').trim().split(/\s+/).filter(Boolean).length;
 }
 
-function limitQuoteDensity(html = '', wordsPerQuote = 300) {
+function limitQuoteDensity(html = '', wordsPerQuote = 350) {
     const input = String(html || '');
     const quoteMatches = [...input.matchAll(/<blockquote[\s\S]*?<\/blockquote>/gi)];
     if (!quoteMatches.length) return input;
@@ -594,7 +806,7 @@ function ensureYoastReady(article = {}) {
         String(article.body_html || '').replace(/<h1[^>]*>[\s\S]*?<\/h1>/gi, ''),
         focus,
     );
-    bodyHtml = enforceOutboundLinkPolicy(bodyHtml);
+    bodyHtml = enforcePublishBodyRules(bodyHtml, article);
 
     return {
         ...article,
@@ -607,19 +819,130 @@ function ensureYoastReady(article = {}) {
     };
 }
 
-function toGutenbergBlocks(html = '') {
+function sanitizeHtmlForGutenberg(html = '') {
+    let out = String(html || '');
+    if (!out.trim()) return '';
+
+    out = out
+        .replace(/\r\n?/g, '\n')
+        .replace(/<hr\b([^>]*)>/gi, '<hr$1/>')
+        .replace(/<p>\s*<hr\b[^>]*\/?>(?:\s|&nbsp;)*<\/p>/gi, '<hr/>')
+        .replace(/<p>([\s\S]*?)<(blockquote|ul|ol|h2|h3)\b([^>]*)>([\s\S]*?)<\/\2>([\s\S]*?)<\/p>/gi,
+            (_, pre, tag, attrs, inner, post) =>
+                `<p>${pre.trim()}</p>\n<${tag}${attrs}>${inner}</${tag}>\n<p>${post.trim()}</p>`)
+        .replace(/<p>\s*<\/p>/gi, '')
+        .replace(/(<p>\s*)+<p>/gi, '<p>')
+        .replace(/<\/p>(\s*<\/p>)+/gi, '</p>')
+        .replace(/<blockquote[^>]*>\s*<\/blockquote>/gi, '')
+        .replace(/<blockquote\b[^>]*>(?![\s\S]*?<\/blockquote>)/gi, '')
+        .replace(/<(ul|ol)\b[^>]*>(?![\s\S]*?<\/\1>)/gi, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
+    return out;
+}
+
+function buildSeparatorBlock() {
+    return '<!-- wp:separator --><hr class="wp-block-separator"/><!-- /wp:separator -->';
+}
+
+function appendFragmentBlocks(parts = [], fragment = '') {
+    const raw = String(fragment || '').trim();
+    if (!raw) return;
+
+    const cleaned = raw
+        .replace(/(?:^|\s)<\/(?:p|blockquote|ul|ol|li|h2|h3)>/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!cleaned) return;
+
+    if (/^<(?:blockquote|ul|ol|li|p|h2|h3)\b[^>]*>$/i.test(cleaned)) return;
+    if (/^<li\b[^>]*>.*$/i.test(cleaned) && !/<\/li>/i.test(cleaned)) {
+        const listText = cleaned.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!listText) return;
+        parts.push(`<!-- wp:paragraph --><p>${listText}</p><!-- /wp:paragraph -->`);
+        return;
+    }
+    if (/^<(?:ul|ol)\b/i.test(cleaned) && !/<\/(?:ul|ol)>/i.test(cleaned)) {
+        const listText = cleaned.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!listText) return;
+        parts.push(`<!-- wp:paragraph --><p>${listText}</p><!-- /wp:paragraph -->`);
+        return;
+    }
+
+    const chunks = cleaned.split(/(<hr\b[^>]*\/?>)/gi).filter(Boolean);
+    chunks.forEach((chunk) => {
+        const value = String(chunk || '').trim();
+        if (!value) return;
+        if (/^<hr\b[^>]*\/?>$/i.test(value)) {
+            parts.push(buildSeparatorBlock());
+            return;
+        }
+        if (/^(?:<\/(?:p|blockquote|ul|ol|li|h2|h3)>\s*)+$/i.test(value)) return;
+        if (/^<[^>]+>/.test(value)) {
+            parts.push(`<!-- wp:html -->${value}<!-- /wp:html -->`);
+            return;
+        }
+        parts.push(`<!-- wp:paragraph --><p>${value}</p><!-- /wp:paragraph -->`);
+    });
+}
+
+function repairGutenbergHtmlBlocks(content = '') {
+    return String(content || '').replace(/<!-- wp:html -->([\s\S]*?)<!-- \/wp:html -->/gi, (_full, inner) => {
+        const html = String(inner || '').trim();
+        if (!html) return '';
+        if (/^(?:<\/(?:p|blockquote|ul|ol|li|h2|h3)>\s*)+$/i.test(html)) return '';
+        if (/^<hr\b[^>]*\/?>$/i.test(html)) return buildSeparatorBlock();
+        return `<!-- wp:html -->${html}<!-- /wp:html -->`;
+    });
+}
+
+function hasBalancedGutenbergComments(content = '') {
+    const stack = [];
+    const pattern = /<!--\s*(\/?)wp:([a-z0-9-]+)(?:\s+[^>]*)?\s*-->/gi;
+    let match;
+    while ((match = pattern.exec(String(content || ''))) !== null) {
+        const closing = match[1] === '/';
+        const name = String(match[2] || '').toLowerCase();
+        if (!name) continue;
+        if (!closing) {
+            stack.push(name);
+            continue;
+        }
+        const prev = stack.pop();
+        if (prev !== name) return false;
+    }
+    return stack.length === 0;
+}
+
+function ensureValidGutenbergContent(content = '') {
+    const repaired = repairGutenbergHtmlBlocks(content)
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    if (!hasBalancedGutenbergComments(repaired)) {
+        const err = new Error('Generated Gutenberg content has unbalanced block comments after repair');
+        err.code = 'invalid_gutenberg_blocks';
+        throw err;
+    }
+    return repaired;
+}
+
+export function toGutenbergBlocks(html = '') {
     if (!html) return '';
-    if (html.includes('<!-- wp:')) return html;
+    if (html.includes('<!-- wp:')) return ensureValidGutenbergContent(html);
+
+    const sanitized = sanitizeHtmlForGutenberg(html);
+    if (!sanitized) return '';
 
     const pattern = /<(p|blockquote|ul|ol|h2|h3)([^>]*)>[\s\S]*?<\/\1>/gi;
     const parts = [];
     let cursor = 0;
     let match;
 
-    while ((match = pattern.exec(html)) !== null) {
-        const before = html.slice(cursor, match.index).trim();
+    while ((match = pattern.exec(sanitized)) !== null) {
+        const before = sanitized.slice(cursor, match.index).trim();
         if (before) {
-            parts.push(`<!-- wp:html -->${before}<!-- /wp:html -->`);
+            appendFragmentBlocks(parts, before);
         }
 
         const raw = match[0];
@@ -629,10 +952,20 @@ function toGutenbergBlocks(html = '') {
         } else if (tag === 'blockquote') {
             const safeQuote = sanitizeQuoteBlock(raw);
             parts.push(`<!-- wp:quote -->${safeQuote}<!-- /wp:quote -->`);
-        } else if (tag === 'ul') {
-            parts.push(`<!-- wp:list -->${raw}<!-- /wp:list -->`);
-        } else if (tag === 'ol') {
-            parts.push(`<!-- wp:list {"ordered":true} -->${raw}<!-- /wp:list -->`);
+        } else if (tag === 'ul' || tag === 'ol') {
+            const listInner = raw.replace(/^<(?:ul|ol)\b[^>]*>/i, '').replace(/<\/(?:ul|ol)>$/i, '');
+            const items = [];
+            const liPattern = /<li\b[^>]*>([\s\S]*?)<\/li>/gi;
+            let liMatch;
+            while ((liMatch = liPattern.exec(listInner)) !== null) {
+                items.push(`<!-- wp:list-item -->\n<li>${liMatch[1].trim()}</li>\n<!-- /wp:list-item -->`);
+            }
+            const innerHtml = items.join('\n');
+            if (tag === 'ol') {
+                parts.push(`<!-- wp:list {"ordered":true} -->\n<ol class="wp-block-list">${innerHtml}</ol>\n<!-- /wp:list -->`);
+            } else {
+                parts.push(`<!-- wp:list -->\n<ul class="wp-block-list">${innerHtml}</ul>\n<!-- /wp:list -->`);
+            }
         } else if (tag === 'h2') {
             parts.push(`<!-- wp:heading {"level":2} -->${raw}<!-- /wp:heading -->`);
         } else if (tag === 'h3') {
@@ -643,15 +976,20 @@ function toGutenbergBlocks(html = '') {
         cursor = pattern.lastIndex;
     }
 
-    const tail = html.slice(cursor).trim();
+    const tail = sanitized.slice(cursor).trim();
     if (tail) {
-        parts.push(`<!-- wp:html -->${tail}<!-- /wp:html -->`);
+        appendFragmentBlocks(parts, tail);
     }
 
-    return parts.join('\n');
+    return ensureValidGutenbergContent(parts.join('\n'));
 }
 
 async function prePublishQualityCheck(article = {}) {
+    // Strip the Related Reading section before handing to the LLM so it cannot
+    // mangle the linked <li> items — we will re-attach it with proper links after.
+    const relatedSectionPattern = /<h2>\s*Related Reading on Barna\.News\s*<\/h2>[\s\S]*?(?=<h2\b|<h3\b|$)/gi;
+    const bodyForLlm = String(article.body_html || '').replace(relatedSectionPattern, '').replace(/\n{3,}/g, '\n\n').trim();
+
     const prompt = `You are a senior SEO editor and WordPress QA specialist. Return JSON only.
 
 Input:
@@ -659,8 +997,8 @@ Input:
 - seo_title: ${JSON.stringify(article.seo_title || article.title || '')}
 - focus_keyphrase: ${JSON.stringify(article.focus_keyphrase || '')}
 - meta_description: ${JSON.stringify(article.meta_description || '')}
-- body_excerpt: ${JSON.stringify(stripHtml(article.body_html || '').slice(0, 1200))}
-- body_html: ${JSON.stringify(String(article.body_html || '').slice(0, 12000))}
+- body_excerpt: ${JSON.stringify(stripHtml(bodyForLlm).slice(0, 1200))}
+- body_html: ${JSON.stringify(bodyForLlm.slice(0, 12000))}
 
 Rules:
 1) Keep title and seo_title distinct when useful, but both high-quality and readable.
@@ -671,7 +1009,8 @@ Rules:
 6) Body must use British English spellings.
 7) Add <h2> subheadings if the article is long and has none.
 8) Reduce passive voice, shorten long sentences, and add natural transition words.
-9) Keep quotes Gutenberg-safe: use <blockquote><p>...</p></blockquote>.
+9) YOU MUST preserve or add inline hyperlinks for any referenced related articles. DO NOT un-link them.
+10) STRICT RULE: Format paragraphs using standard HTML (<p>, <h2>, <blockquote>, <ul>). NEVER output WordPress block comments (e.g. <!-- wp:paragraph -->).
 
 Output schema:
 {
@@ -685,10 +1024,11 @@ Output schema:
 
     try {
         const qa = await generateWithFlash(prompt, { jsonMode: true, stage: 'prepublish_qa' });
-        const bodyHtmlCandidate = improveBodyHtmlForPublish(qa?.body_html || article.body_html || '', qa?.focus_keyphrase || article.focus_keyphrase || '');
+        // Improve body but do NOT re-attach related section here — publishDraft owns that
+        const bodyHtmlCandidate = improveBodyHtmlForPublish(qa?.body_html || bodyForLlm, qa?.focus_keyphrase || article.focus_keyphrase || '');
         const optimizedMeta = await optimizeMetaDescriptionWithFlash({
             existing: qa?.meta_description || article.meta_description || '',
-            bodyText: stripHtml(bodyHtmlCandidate || article.body_html || ''),
+            bodyText: stripHtml(bodyHtmlCandidate || bodyForLlm),
             focus: qa?.focus_keyphrase || article.focus_keyphrase || '',
             title: qa?.title || article.title || '',
         });
@@ -792,6 +1132,55 @@ function getAuthHeaders() {
     return { 'Authorization': `Basic ${auth}` };
 }
 
+function isTransportError(err) {
+    const message = String(err?.message || '').toLowerCase();
+    const causeCode = String(err?.cause?.code || '').toLowerCase();
+    return (
+        message.includes('fetch failed') ||
+        message.includes('network') ||
+        message.includes('socket hang up') ||
+        causeCode.includes('econnreset') ||
+        causeCode.includes('enotfound') ||
+        causeCode.includes('etimedout')
+    );
+}
+
+function isRetryableWordPressError(err) {
+    const status = Number(err?.status || 0);
+    if (isTransportError(err)) return true;
+    if (status === 408 || status === 429) return true;
+    if (status >= 500) return true;
+    return false;
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function withRetries(label, task, {
+    attempts = 3,
+    baseDelayMs = 900,
+} = {}) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            return await task();
+        } catch (err) {
+            lastError = err;
+            if (!isRetryableWordPressError(err) || attempt >= attempts) break;
+            const waitMs = baseDelayMs * attempt;
+            console.warn(`  ⚠️  ${label} failed (attempt ${attempt}/${attempts}): ${err.message}. Retrying in ${waitMs}ms...`);
+            await delay(waitMs);
+        }
+    }
+
+    if (lastError) {
+        lastError.retryable = isRetryableWordPressError(lastError);
+        throw lastError;
+    }
+    throw new Error(`${label} failed`);
+}
+
 async function syncYoastMeta(postId, { focuskw, title, metadesc }) {
     const payload = {
         post_id: Number(postId),
@@ -859,13 +1248,49 @@ export async function getCategories() {
     }
 }
 
+// Maps WordPress category names to Reddit flair names for r/BCNEnglishSpeakers.
+// Category name comparison is case-insensitive; add entries here as needed.
+const CATEGORY_TO_REDDIT_FLAIR = {
+    'crime': 'Crime',
+    'culture': 'Culture',
+    'catalan': 'Catalan / Catalonia',
+    'catalonia': 'Catalan / Catalonia',
+    'catalan / catalonia': 'Catalan / Catalonia',
+    'transport': 'Transport',
+    'politics': 'Politics',
+    'economy': 'Economy & Finance',
+    'economy & finance': 'Economy & Finance',
+    'finance': 'Economy & Finance',
+    'housing': 'Housing',
+    'urban development': 'Urban Development',
+    'urban': 'Urban Development',
+    'environment': 'Environment',
+    'tourism': 'Tourism',
+    'health': 'Health',
+    'education': 'Education',
+    'sport': 'Sport',
+    'sports': 'Sport',
+    'technology': 'Technology',
+    'food & drink': 'Food & Drink',
+    'food': 'Food & Drink',
+};
+
+function mapCategoryToFlair(categoryNames = []) {
+    for (const name of categoryNames) {
+        const key = String(name || '').trim().toLowerCase();
+        if (CATEGORY_TO_REDDIT_FLAIR[key]) return CATEGORY_TO_REDDIT_FLAIR[key];
+    }
+    return '';
+}
+
 export async function getRecentPostsForSocial({ limit = 20 } = {}) {
     const safeLimit = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(100, Math.floor(Number(limit)))) : 20;
     const headers = getAuthHeaders();
+    const postFields = 'id,title,link,date,status,excerpt,content,featured_media,categories,_embedded.wp:featuredmedia,_embedded.wp:term';
 
     const [publishedRes, draftRes] = await Promise.all([
-        fetch(`${WP_URL()}/wp-json/wp/v2/posts?status=publish&per_page=${safeLimit}&_fields=id,title,link,date,status,excerpt,content`, { headers }),
-        fetch(`${WP_URL()}/wp-json/wp/v2/posts?status=draft&context=edit&per_page=${safeLimit}&_fields=id,title,link,date,status,excerpt,content`, { headers }),
+        fetch(`${WP_URL()}/wp-json/wp/v2/posts?status=publish&per_page=${safeLimit}&_embed=wp:featuredmedia,wp:term&_fields=${encodeURIComponent(postFields)}`, { headers }),
+        fetch(`${WP_URL()}/wp-json/wp/v2/posts?status=draft&context=edit&per_page=${safeLimit}&_embed=wp:featuredmedia,wp:term&_fields=${encodeURIComponent(postFields)}`, { headers }),
     ]);
 
     const parsePosts = async (res) => {
@@ -884,6 +1309,17 @@ export async function getRecentPostsForSocial({ limit = 20 } = {}) {
     for (const post of merged) {
         if (!post?.id || seen.has(post.id)) continue;
         seen.add(post.id);
+        const featured = post?._embedded?.['wp:featuredmedia']?.[0] || null;
+        const featuredSizes = featured?.media_details?.sizes || {};
+        const featuredImageUrl = featured?.source_url || '';
+        const featuredThumb = featuredSizes?.medium_large?.source_url || featuredSizes?.medium?.source_url || featuredSizes?.thumbnail?.source_url || featuredImageUrl;
+
+        // Extract category names from embedded wp:term (index 0 = categories, index 1 = tags)
+        const embeddedTerms = post?._embedded?.['wp:term'] || [];
+        const categoryTerms = Array.isArray(embeddedTerms[0]) ? embeddedTerms[0] : [];
+        const categoryNames = categoryTerms.map(t => t?.name || '').filter(Boolean);
+        const predicted_flair = mapCategoryToFlair(categoryNames);
+
         deduped.push({
             id: post.id,
             title: post?.title?.rendered || post?.title?.raw || '',
@@ -893,6 +1329,10 @@ export async function getRecentPostsForSocial({ limit = 20 } = {}) {
             excerpt: post?.excerpt?.rendered || post?.excerpt?.raw || '',
             content: post?.content?.rendered || post?.content?.raw || '',
             summary: stripHtml(post?.excerpt?.rendered || post?.excerpt?.raw || post?.content?.rendered || post?.content?.raw || '').slice(0, 600),
+            featured_image_url: featuredImageUrl,
+            featured_image_thumb_url: featuredThumb,
+            featured_image_alt: featured?.alt_text || '',
+            predicted_flair,
         });
     }
 
@@ -945,32 +1385,35 @@ async function getOrCreateTags(tagNames) {
  * Upload a featured image to WordPress media library
  */
 async function uploadFeaturedImage(imageData, title) {
-    const form = new FormData();
     const filename = title.replace(/[^a-z0-9]/gi, '-').toLowerCase().substring(0, 50) + '.jpg';
 
-    form.append('file', imageData.buffer, {
-        filename,
-        contentType: imageData.mimeType,
-        knownLength: imageData.buffer.length,
+    const media = await withRetries('WordPress media upload', async () => {
+        const form = new FormData();
+        form.append('file', imageData.buffer, {
+            filename,
+            contentType: imageData.mimeType,
+            knownLength: imageData.buffer.length,
+        });
+        form.append('title', title);
+        form.append('alt_text', imageData.altText || title);
+        const res = await fetch(`${WP_URL()}/wp-json/wp/v2/media`, {
+            method: 'POST',
+            headers: {
+                ...getAuthHeaders(),
+                ...form.getHeaders(),
+            },
+            body: form,
+        });
+        if (!res.ok) {
+            const errorText = await res.text();
+            const err = new Error(`Media upload failed (${res.status}): ${errorText}`);
+            err.status = res.status;
+            err.retryable = isRetryableWordPressError(err);
+            throw err;
+        }
+        return await res.json();
     });
-    form.append('title', title);
-    form.append('alt_text', imageData.altText || title);
 
-    const res = await fetch(`${WP_URL()}/wp-json/wp/v2/media`, {
-        method: 'POST',
-        headers: {
-            ...getAuthHeaders(),
-            ...form.getHeaders(),
-        },
-        body: form,
-    });
-
-    if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(`Media upload failed (${res.status}): ${errorText}`);
-    }
-
-    const media = await res.json();
     return media.id;
 }
 
@@ -1021,7 +1464,33 @@ export async function publishDraft(article, imageData) {
         ...normalized,
         ...qaRefined,
         body_html: qaRefined.body_html || normalized.body_html,
+        // Always preserve original relatedArticles so the linked section is correct
+        relatedArticles: normalized.relatedArticles || article.relatedArticles || [],
+        research: normalized.research || article.research || {},
     };
+    // Re-attach the Related Reading section with proper hyperlinks after the LLM QA pass
+    // (the LLM strips <a> tags from list items; this restores them authoritatively)
+    finalArticle.body_html = normalizeRelatedReadingSections(
+        finalArticle.body_html || '',
+        finalArticle.relatedArticles,
+    );
+    finalArticle.body_html = enforcePublishBodyRules(finalArticle.body_html || '', finalArticle);
+    let publishValidation = validatePublishBodyRules(finalArticle.body_html || '');
+    if (!publishValidation.valid) {
+        finalArticle.body_html = enforcePublishBodyRules(finalArticle.body_html || '', {
+            ...finalArticle,
+            relatedArticles: finalArticle.relatedArticles || article.relatedArticles || [],
+            research: finalArticle.research || article.research || {},
+        });
+        publishValidation = validatePublishBodyRules(finalArticle.body_html || '');
+    }
+    if (!publishValidation.valid) {
+        const err = new Error(`Article failed publish validation: ${JSON.stringify(publishValidation)}`);
+        err.code = 'article_validation_failed';
+        err.details = publishValidation;
+        throw err;
+    }
+    const gutenbergContent = toGutenbergBlocks(finalArticle.body_html);
     console.log(`📤 Publishing draft: ${finalArticle.title}`);
     const headers = { ...getAuthHeaders(), 'Content-Type': 'application/json' };
 
@@ -1030,9 +1499,7 @@ export async function publishDraft(article, imageData) {
     if (imageData) {
         try {
             console.log('  🖼️  Uploading featured image...');
-            imageData.altText = finalArticle.focus_keyphrase
-                ? `${finalArticle.focus_keyphrase} - ${finalArticle.title}`
-                : finalArticle.title;
+            imageData.altText = buildImageAltText(finalArticle);
             featuredMediaId = await uploadFeaturedImage(imageData, article.title);
         } catch (err) {
             console.error('  ⚠️  Image upload failed:', err.message);
@@ -1050,7 +1517,7 @@ export async function publishDraft(article, imageData) {
     // Build post data
     const buildPostData = (includeAuthor = true) => ({
         title: finalArticle.title,
-        content: toGutenbergBlocks(finalArticle.body_html),
+        content: gutenbergContent,
         excerpt: finalArticle.meta_description,
         status: 'draft',
         slug: finalArticle.slug,
@@ -1067,28 +1534,30 @@ export async function publishDraft(article, imageData) {
     });
 
     async function createPost(includeAuthor = true) {
-        const res = await fetch(`${WP_URL()}/wp-json/wp/v2/posts`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(buildPostData(includeAuthor)),
+        return await withRetries('WordPress post creation', async () => {
+            const res = await fetch(`${WP_URL()}/wp-json/wp/v2/posts`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(buildPostData(includeAuthor)),
+            });
+            if (res.ok) {
+                return await res.json();
+            }
+
+            const errorText = await res.text();
+            let errorCode = '';
+            try {
+                const parsed = JSON.parse(errorText);
+                errorCode = parsed?.code || '';
+            } catch {
+                // non-JSON WP error body
+            }
+            const err = new Error(`Post creation failed (${res.status}): ${errorText}`);
+            err.status = res.status;
+            err.code = errorCode;
+            err.retryable = isRetryableWordPressError(err);
+            throw err;
         });
-
-        if (res.ok) {
-            return await res.json();
-        }
-
-        const errorText = await res.text();
-        let errorCode = '';
-        try {
-            const parsed = JSON.parse(errorText);
-            errorCode = parsed?.code || '';
-        } catch {
-            // non-JSON WP error body
-        }
-        const err = new Error(`Post creation failed (${res.status}): ${errorText}`);
-        err.status = res.status;
-        err.code = errorCode;
-        throw err;
     }
 
     let post;
@@ -1099,6 +1568,7 @@ export async function publishDraft(article, imageData) {
             console.warn('  ⚠️  Cannot publish as selected author. Retrying as authenticated user...');
             post = await createPost(false);
         } else {
+            err.retryable = isRetryableWordPressError(err);
             throw err;
         }
     }

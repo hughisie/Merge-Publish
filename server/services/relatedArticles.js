@@ -1,6 +1,22 @@
 import fetch from 'node-fetch';
 import { generateWithFlash } from './llmClient.js';
 
+function decodeHtmlEntities(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(dec))
+        .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#8217;/g, "'")
+        .replace(/&#8216;/g, "'")
+        .replace(/&#8220;/g, '"')
+        .replace(/&#8221;/g, '"');
+}
+
 const WP_URL = () => process.env.WP_URL || 'https://barna.news';
 const RECENCY_DAYS = 90;
 
@@ -92,7 +108,7 @@ Current story:
 Candidate posts:
 ${JSON.stringify(candidates.map(item => ({
         id: item.id,
-        title: item.title,
+        title: decodeHtmlEntities(item.title),
         date: item.date,
         excerpt: String(item.excerpt || '').replace(/<[^>]+>/g, ' ').slice(0, 240),
     })), null, 2)}
@@ -144,7 +160,7 @@ export async function findRelatedArticles(headline, keywords = [], { context = '
         try {
             const posts = await fetchPostsByTerm(term, seen, cutoff);
             for (const post of posts) {
-                const title = post.title?.rendered || '';
+                const title = decodeHtmlEntities(post.title?.rendered || '');
                 const lexical = overlapScore(referenceTokens, tokenSet(title));
                 const score = lexical + recencyBoost(post.date);
                 if (score < 0.12) continue;
@@ -168,7 +184,7 @@ export async function findRelatedArticles(headline, keywords = [], { context = '
         try {
             const fallbackPosts = await fetchRecentFallback(seen, cutoff);
             for (const post of fallbackPosts) {
-                const title = post.title?.rendered || '';
+                const title = decodeHtmlEntities(post.title?.rendered || '');
                 const lexical = overlapScore(referenceTokens, tokenSet(title));
                 results.push({
                     id: post.id,

@@ -2,6 +2,24 @@ const API_BASE = '/api';
 const STORY_TYPES = ['news', 'feature', 'interview', 'opinion', 'review', 'recommendation', 'whats_on', 'history', 'other'];
 const GENERATION_CONCURRENCY = 2;
 const GENERATION_ETA_WINDOW = 5;
+const PUBLISH_ATTEMPTS = 2;
+const PUBLISH_RETRY_BASE_DELAY_MS = 800;
+const DEFAULT_WHATSAPP_CHANNELS = [
+    {
+        id: 'broadcast_channel',
+        label: 'Broadcast Channel',
+        url: 'https://whatsapp.com/channel/0029Vb6PJDh6WaKjaAcWAX1h',
+        to: '0029Vb6PJDh6WaKjaAcWAX1h@newsletter',
+        mode: 'open_url',
+    },
+    {
+        id: 'news_flash',
+        label: 'News-Flash',
+        url: 'https://chat.whatsapp.com/',
+        to: '120363269876975950@g.us',
+        mode: 'api',
+    },
+];
 
 const app = {
     state: {
@@ -24,6 +42,11 @@ const app = {
         publishStartedAt: null,
         publishTotal: 0,
         publishCompleted: 0,
+        publishSuccess: 0,
+        publishFailed: 0,
+        publishFailures: [],
+        isPublishing: false,
+        autoPublishAfterGeneration: false,
         generationTimerInterval: null,
         generationStartedAt: null,
         generationTotal: 0,
@@ -36,6 +59,8 @@ const app = {
             inputTokens: 0,
             outputTokens: 0,
             estimatedCostUsd: 0,
+            byStage: {},
+            byStageModels: {},
         },
     },
 
@@ -63,7 +88,10 @@ const app = {
         }
 
         document.getElementById('btn-confirm-clusters').addEventListener('click', () => this.startGeneration());
+        document.getElementById('btn-generate-publish').addEventListener('click', () => this.startGenerateAndPublish());
+        document.getElementById('btn-generate-publish-review')?.addEventListener('click', () => this.startGenerateAndPublish());
         document.getElementById('btn-publish-all').addEventListener('click', () => this.publishAll());
+        document.getElementById('btn-retry-failed-publish').addEventListener('click', () => this.retryFailedPublishes());
         document.getElementById('btn-open-social').addEventListener('click', () => this.goToStep(4));
         document.getElementById('btn-retry-failed').addEventListener('click', () => this.retryFailedGeneration());
         document.getElementById('btn-load-recent-posts').addEventListener('click', () => this.loadRecentPosts());
@@ -297,6 +325,8 @@ const app = {
     updatePublishProgress(label = '') {
         const done = this.state.publishCompleted;
         const total = this.state.publishTotal;
+        const success = this.state.publishSuccess;
+        const failed = this.state.publishFailed;
         const progressEl = document.getElementById('publish-overall-progress');
         const labelEl = document.getElementById('publish-overall-label');
         const etaEl = document.getElementById('publish-eta');
@@ -304,8 +334,8 @@ const app = {
 
         if (progressEl) progressEl.style.width = `${pct}%`;
         if (labelEl) {
-            const suffix = total > 0 ? `(${done}/${total})` : '';
-            labelEl.innerText = label ? `${label} ${suffix}`.trim() : suffix;
+            const summary = `Published ${success} / Total ${total} · Failed ${failed}`;
+            labelEl.innerText = label ? `${label} · ${summary}` : summary;
         }
 
         if (etaEl) {
@@ -318,6 +348,13 @@ const app = {
                 etaEl.innerText = `ETA ${this.formatDuration(rolling.remainingMs)}`;
             }
         }
+        this.renderPublishOutcomeSummary();
+    },
+
+    renderPublishOutcomeSummary() {
+        const el = document.getElementById('publish-outcome-summary');
+        if (!el) return;
+        el.innerText = `Published ${this.state.publishSuccess} / Total ${this.state.publishTotal} · Failed ${this.state.publishFailed}`;
     },
 
     computeRollingEstimate(durations = [], startedAt = null, done = 0, total = 0, windowSize = 5) {
@@ -344,14 +381,125 @@ const app = {
         totals.inputTokens += Number(delta.inputTokens || 0);
         totals.outputTokens += Number(delta.outputTokens || 0);
         totals.estimatedCostUsd += Number(delta.estimatedCostUsd || 0);
+
+        const byStage = delta.byStage || {};
+        Object.entries(byStage).forEach(([stage, usage]) => {
+            if (!totals.byStage[stage]) {
+                totals.byStage[stage] = { calls: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 };
+            }
+            totals.byStage[stage].calls += Number(usage.calls || 0);
+            totals.byStage[stage].inputTokens += Number(usage.inputTokens || 0);
+            totals.byStage[stage].outputTokens += Number(usage.outputTokens || 0);
+            totals.byStage[stage].estimatedCostUsd += Number(usage.estimatedCostUsd || 0);
+        });
+
+        const byStageModels = delta.byStageModels || {};
+        Object.entries(byStageModels).forEach(([stage, models]) => {
+            if (!totals.byStageModels[stage]) totals.byStageModels[stage] = {};
+            Object.entries(models || {}).forEach(([model, usage]) => {
+                if (!totals.byStageModels[stage][model]) {
+                    totals.byStageModels[stage][model] = { calls: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 };
+                }
+                totals.byStageModels[stage][model].calls += Number(usage.calls || 0);
+                totals.byStageModels[stage][model].inputTokens += Number(usage.inputTokens || 0);
+                totals.byStageModels[stage][model].outputTokens += Number(usage.outputTokens || 0);
+                totals.byStageModels[stage][model].estimatedCostUsd += Number(usage.estimatedCostUsd || 0);
+            });
+        });
+
         this.renderUsageSummary();
     },
 
     renderUsageSummary() {
         const usageEl = document.getElementById('usage-summary');
+        const breakdownEl = document.getElementById('usage-stage-breakdown');
         if (!usageEl) return;
         const usage = this.state.usageTotals;
         usageEl.innerText = `API calls ${usage.calls} · In ${usage.inputTokens} tok · Out ${usage.outputTokens} tok · Est $${usage.estimatedCostUsd.toFixed(4)}`;
+
+        if (!breakdownEl) return;
+        const rows = Object.entries(usage.byStage || {})
+            .sort((a, b) => Number(b[1]?.estimatedCostUsd || 0) - Number(a[1]?.estimatedCostUsd || 0));
+
+        if (!rows.length) {
+            breakdownEl.innerText = 'No stage usage recorded yet.';
+            return;
+        }
+
+        breakdownEl.innerHTML = rows.map(([stage, row]) => {
+            const modelMap = usage.byStageModels?.[stage] || {};
+            const models = Object.entries(modelMap)
+                .sort((a, b) => Number(b[1]?.calls || 0) - Number(a[1]?.calls || 0))
+                .map(([model, modelRow]) => `${this.escapeHtml(model)} (${Number(modelRow.calls || 0)} calls)`)
+                .join(', ');
+            return `<div class="usage-stage-row"><strong>${this.escapeHtml(stage)}</strong> · ${Number(row.calls || 0)} calls · In ${Number(row.inputTokens || 0)} · Out ${Number(row.outputTokens || 0)} · $${Number(row.estimatedCostUsd || 0).toFixed(4)}${models ? ` · Models: ${models}` : ''}</div>`;
+        }).join('');
+    },
+
+    async sleep(ms) {
+        await new Promise(resolve => setTimeout(resolve, ms));
+    },
+
+    isRetryablePublishError(err) {
+        if (err?.retryable === true) return true;
+        const status = Number(err?.status || 0);
+        const message = String(err?.message || '').toLowerCase();
+        if (status >= 500 || status === 408 || status === 429) return true;
+        return message.includes('failed to fetch') || message.includes('network') || message.includes('socket') || message.includes('timeout');
+    },
+
+    resetPublishState(total = 0) {
+        this.state.publishStartedAt = Date.now();
+        this.state.publishTotal = total;
+        this.state.publishCompleted = 0;
+        this.state.publishSuccess = 0;
+        this.state.publishFailed = 0;
+        this.state.publishDurationsMs = [];
+        this.state.publishFailures = [];
+        const retryBtn = document.getElementById('btn-retry-failed-publish');
+        if (retryBtn) retryBtn.disabled = true;
+        this.renderPublishOutcomeSummary();
+    },
+
+    async requestPublishDraftWithRetry(article, { maxAttempts = PUBLISH_ATTEMPTS } = {}) {
+        let lastError = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            try {
+                const res = await fetch(`${API_BASE}/publish-draft`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ article }),
+                });
+
+                const raw = await res.text();
+                let data = {};
+                try {
+                    data = raw ? JSON.parse(raw) : {};
+                } catch {
+                    data = { error: raw || `HTTP ${res.status}` };
+                }
+
+                if (!res.ok || data.error) {
+                    const error = new Error(data.error || `Publish request failed (${res.status})`);
+                    error.status = res.status;
+                    error.retryable = Boolean(data.retryable);
+                    error.code = data.code || '';
+                    error.details = data.details || null;
+                    throw error;
+                }
+
+                return { data, attempt };
+            } catch (err) {
+                lastError = err;
+                if (!this.isRetryablePublishError(err) || attempt >= maxAttempts) {
+                    err.attempt = attempt;
+                    throw err;
+                }
+                await this.sleep(PUBLISH_RETRY_BASE_DELAY_MS * attempt);
+            }
+        }
+
+        throw lastError || new Error('Publish failed');
     },
 
     normalizeLinkHover(container) {
@@ -829,6 +977,10 @@ const app = {
         progressEl.innerHTML = '';
 
         const clustersToProcess = this.state.clusters.filter(c => toProcessIds.has(c.cluster_id));
+        this.state.generatedArticles = {};
+        this.state.editorDrafts = {};
+        this.state.previewingClusterId = null;
+        document.getElementById('preview-container').innerHTML = '';
         this.state.generationTotal = clustersToProcess.length;
         this.state.generationCompleted = 0;
         this.state.generationDurationsMs = [];
@@ -856,7 +1008,30 @@ const app = {
             failed: this.state.generationFailed.length,
         });
 
-        document.getElementById('btn-publish-all').disabled = false;
+        document.getElementById('btn-publish-all').disabled = Object.keys(this.state.generatedArticles).length === 0;
+
+        if (this.state.autoPublishAfterGeneration) {
+            this.state.autoPublishAfterGeneration = false;
+            if (!Object.keys(this.state.generatedArticles).length) {
+                alert('Generation finished, but no articles were available to publish.');
+                return;
+            }
+            await this.publishAll({ confirmFirst: false, fromGeneratePublish: true });
+        }
+    },
+
+    async startGenerateAndPublish() {
+        if (this.state.isPublishing) return;
+        this.setLoading('btn-generate-publish-review', true);
+        this.state.autoPublishAfterGeneration = true;
+        try {
+            await this.startGeneration();
+        } catch (err) {
+            this.state.autoPublishAfterGeneration = false;
+            throw err;
+        } finally {
+            this.setLoading('btn-generate-publish-review', false);
+        }
     },
 
     async retryFailedGeneration() {
@@ -1017,12 +1192,84 @@ const app = {
     buildRedditSubmitUrl(post = {}) {
         const title = post.title || 'Barna.News update';
         const text = `${this.buildFirstSentence(post)}\n\n${post.link || ''}`;
-        return `https://www.reddit.com/submit?title=${encodeURIComponent(title)}&text=${encodeURIComponent(text)}`;
+        const flair = post.predicted_flair || '';
+        let url = `https://old.reddit.com/r/BCNEnglishSpeakers/submit?title=${encodeURIComponent(title)}&text=${encodeURIComponent(text)}&selftext=true`;
+        if (flair) {
+            url += `&flair=${encodeURIComponent(flair)}&flair_text=${encodeURIComponent(flair)}`;
+        }
+        return url;
     },
 
     buildXIntentUrl(post = {}) {
         const text = this.buildXText(post);
         return `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}`;
+    },
+
+    buildXSocialHtml(posts = []) {
+        const rows = posts.map((post, idx) => {
+            const text = this.buildXText(post);
+            const intentUrl = this.buildXIntentUrl(post);
+            const imageUrl = post.featured_image_url || '';
+            const imageThumb = post.featured_image_thumb_url || imageUrl;
+            const imageAlt = post.featured_image_alt || post.title || 'Featured image';
+            const imagePanel = imageUrl
+                ? `<div class="x-media-card">
+              <img src="${this.escapeHtml(imageThumb)}" alt="${this.escapeHtml(imageAlt)}" loading="lazy" />
+              <div class="actions">
+                <a href="${this.escapeHtml(imageUrl)}" target="_blank">Open featured image</a>
+                <button type="button" class="copy-image-url" data-image-url="${this.escapeHtml(imageUrl)}">Copy image URL</button>
+              </div>
+            </div>`
+                : '<p class="muted">No featured image found for this post.</p>';
+
+            return `<article class="item">
+          <h2>${idx + 1}. ${this.escapeHtml(post.title || 'Untitled')}</h2>
+          <pre>${this.escapeHtml(text)}</pre>
+          ${imagePanel}
+          <div class="actions"><a href="${this.escapeHtml(intentUrl)}" target="_blank">Open prefilled X post</a></div>
+        </article>`;
+        }).join('\n');
+
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>X Social Export</title>
+  <style>
+    body{font-family:Arial,sans-serif;padding:24px;line-height:1.5;background:#f5f7fb;color:#18212b}
+    .item{background:#fff;border:1px solid #dde5ee;border-radius:10px;padding:14px;margin-bottom:18px}
+    pre{white-space:pre-wrap;background:#f5f7fb;padding:12px;border:1px solid #e4ebf3;border-radius:8px}
+    .actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+    .actions a,.actions button{display:inline-block;border:0;background:#0b63ce;color:#fff;padding:8px 11px;border-radius:8px;text-decoration:none;cursor:pointer;font-weight:600}
+    .actions button{background:#4c5a69}
+    .x-media-card{margin-top:10px;background:#f9fbfd;border:1px solid #e4ebf3;border-radius:8px;padding:10px}
+    .x-media-card img{max-width:320px;width:100%;height:auto;border-radius:8px;display:block}
+    .muted{color:#5b6876;font-size:0.92rem}
+  </style>
+</head>
+<body>
+  <h1>X Social Export (${posts.length} posts)</h1>
+  <p class="muted">X intent links cannot reliably pre-attach images. Open the featured image first, then attach it in composer.</p>
+  ${rows}
+  <script>
+    document.addEventListener('click', async function (event) {
+      var btn = event.target.closest('.copy-image-url');
+      if (!btn) return;
+      var url = String(btn.getAttribute('data-image-url') || '');
+      if (!url) return;
+      try {
+        await navigator.clipboard.writeText(url);
+        var original = btn.textContent;
+        btn.textContent = 'Copied image URL';
+        setTimeout(function () { btn.textContent = original; }, 1200);
+      } catch (_err) {
+        alert('Could not copy image URL. Please copy manually.');
+      }
+    });
+  </script>
+</body>
+</html>`;
     },
 
     renderRecentPosts() {
@@ -1045,6 +1292,7 @@ const app = {
               <span>${new Date(post.date).toLocaleString()}</span>
             </div>
             <h4>${this.escapeHtml(post.title || 'Untitled')}</h4>
+            ${post.featured_image_thumb_url ? `<img src="${this.escapeHtml(post.featured_image_thumb_url)}" alt="${this.escapeHtml(post.featured_image_alt || post.title || 'Featured image')}" style="max-width:220px;width:100%;height:auto;border-radius:8px;border:1px solid #dce3ea;margin-bottom:8px;">` : ''}
             <p>${this.escapeHtml(this.truncateAtWordBoundary(post.summary || '', 220))}</p>
             <a href="${post.link}" target="_blank">${this.escapeHtml(post.link || '')}</a>
           </div>
@@ -1096,6 +1344,465 @@ const app = {
         return URL.createObjectURL(blob);
     },
 
+    buildWhatsappSocialHtml(posts = []) {
+        const channelSeed = DEFAULT_WHATSAPP_CHANNELS.map(channel => ({
+            id: channel.id,
+            label: channel.label,
+            url: channel.url,
+            to: channel.to || '',
+            mode: channel.mode || 'open_url',
+        }));
+        const normalizedPosts = posts.map((post, idx) => ({
+            id: Number(post?.id) || idx + 1,
+            index: idx + 1,
+            title: post?.title || 'Untitled',
+            body: this.buildWhatsappText(post),
+        }));
+
+        const embeddedChannels = JSON.stringify(channelSeed).replace(/</g, '\\u003c');
+        const embeddedPosts = JSON.stringify(normalizedPosts).replace(/</g, '\\u003c');
+
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WhatsApp Posts - ${normalizedPosts.length} Articles</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: Arial, sans-serif; margin: 0; background: #f3f5f8; color: #1f2933; }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 16px; color: #0f8c4f; border-bottom: 3px solid #0f8c4f; padding-bottom: 10px; }
+    .panel { background: #fff; border: 1px solid #dce3ea; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+    .panel h2 { margin: 0 0 10px; font-size: 1.05rem; }
+    .inline { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    input[type="text"], input[type="url"] { border: 1px solid #c7d2de; border-radius: 8px; padding: 8px 10px; min-width: 220px; }
+    select { border: 1px solid #c7d2de; border-radius: 8px; padding: 8px 10px; min-width: 180px; background: #fff; }
+    .btn { border: 0; border-radius: 8px; padding: 9px 12px; font-weight: 600; cursor: pointer; }
+    .btn-primary { background: #117a44; color: #fff; }
+    .btn-secondary { background: #0b5f95; color: #fff; }
+    .btn-neutral { background: #e9eef4; color: #223; }
+    .btn-danger { background: #b62f2f; color: #fff; }
+    .muted { color: #5b6876; font-size: 0.9rem; }
+    .channel-list { margin-top: 10px; display: grid; gap: 8px; }
+    .channel-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: #f8fafc; border: 1px solid #e3e9ef; border-radius: 8px; padding: 8px 10px; }
+    .story { background: #fff; border: 1px solid #dce3ea; border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+    .story h3 { margin: 0 0 10px; }
+    pre { white-space: pre-wrap; background: #f5f7fb; border: 1px solid #e6ebf1; border-radius: 8px; padding: 12px; }
+    .story-channels { margin: 10px 0; display: grid; gap: 8px; }
+    .story-channel { display: flex; align-items: center; gap: 8px; }
+    .story-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .status { margin-top: 8px; font-size: 0.9rem; }
+    .status.error { color: #b22929; }
+    .status.ok { color: #117a44; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>WhatsApp Posts - ${normalizedPosts.length} Articles</h1>
+
+    <div class="panel">
+      <h2>Distribution channels</h2>
+      <div class="inline">
+        <input id="channel-label" type="text" placeholder="Channel label" />
+        <input id="channel-url" type="url" placeholder="https://whatsapp.com/channel/..." />
+        <input id="channel-to" type="text" placeholder="Provider destination (e.g. 1203...@g.us)" />
+        <select id="channel-mode">
+          <option value="open_url">Open URL + copy text</option>
+          <option value="api">Send via API destination</option>
+        </select>
+        <button class="btn btn-primary" id="add-channel">Add channel</button>
+      </div>
+      <div class="inline" style="margin-top:10px;">
+        <button class="btn btn-neutral" id="select-all-channels-all">Select all channels for all stories</button>
+        <button class="btn btn-neutral" id="clear-all-channels-all">Clear all channels for all stories</button>
+      </div>
+      <div class="channel-list" id="channel-list"></div>
+      <div class="muted">Channels are saved locally in this browser for future exports.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Bulk send</h2>
+      <div class="inline">
+        <button class="btn btn-secondary" id="send-selected-stories">Send selected stories</button>
+      </div>
+      <div class="muted">Only stories with the bulk checkbox enabled are included. Each story can target one or multiple channels.</div>
+    </div>
+
+    <div id="stories"></div>
+  </div>
+
+  <script>
+    (function () {
+      var STORAGE_KEY = 'whatsapp-export-channels-v1';
+      var defaultChannels = ${embeddedChannels};
+      var posts = ${embeddedPosts};
+      var channels = loadChannels();
+
+      function escapeHtml(value) {
+        return String(value || '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function normalizeId(label) {
+        return String(label || 'channel')
+          .toLowerCase()
+          .trim()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/(^-|-$)/g, '') || ('channel-' + Date.now());
+      }
+
+      function normalizeMode(mode) {
+        return mode === 'api' ? 'api' : 'open_url';
+      }
+
+      function isValidDestination(to) {
+        return /^[\\d-]{9,31}(@[\\w.]{1,})?$/.test(String(to || '').trim());
+      }
+
+      function inferDefaultsByLabel(label) {
+        var normalized = String(label || '').trim().toLowerCase();
+        if (normalized === 'news-flash' || normalized === 'news flash') {
+          return { to: '120363269876975950@g.us', mode: 'api' };
+        }
+        if (normalized === 'broadcast channel') {
+          return { to: '0029Vb6PJDh6WaKjaAcWAX1h@newsletter', mode: 'open_url' };
+        }
+        return { to: '', mode: 'open_url' };
+      }
+
+      function isValidChannel(entry) {
+        var mode = normalizeMode(entry && entry.mode);
+        return entry
+          && typeof entry.label === 'string'
+          && entry.label.trim().length
+          && typeof entry.url === 'string'
+          && /^https?:\/\//i.test(entry.url.trim())
+          && (mode !== 'api' || isValidDestination(entry.to));
+      }
+
+      function loadChannels() {
+        try {
+          var stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+          if (Array.isArray(stored)) {
+            var parsed = stored.filter(isValidChannel).map(function (entry) {
+              var inferred = inferDefaultsByLabel(entry.label);
+              return {
+                id: String(entry.id || normalizeId(entry.label)),
+                label: entry.label.trim(),
+                url: entry.url.trim(),
+                to: String(entry.to || inferred.to || '').trim(),
+                mode: normalizeMode(entry.mode || inferred.mode),
+              };
+            });
+            if (parsed.length) return parsed;
+          }
+        } catch (_err) {}
+        return defaultChannels.slice();
+      }
+
+      function saveChannels() {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(channels));
+      }
+
+      function getStorySelections() {
+        var map = {};
+        document.querySelectorAll('.story').forEach(function (storyEl) {
+          var storyId = storyEl.getAttribute('data-story-id');
+          var selectedChannels = new Set();
+          storyEl.querySelectorAll('.story-channel-check:checked').forEach(function (cb) {
+            selectedChannels.add(cb.value);
+          });
+          map[storyId] = {
+            bulk: !!storyEl.querySelector('.story-bulk-toggle')?.checked,
+            channels: selectedChannels,
+          };
+        });
+        return map;
+      }
+
+      function setStatus(storyId, message, tone) {
+        var el = document.getElementById('status-' + storyId);
+        if (!el) return;
+        el.textContent = message || '';
+        el.className = 'status ' + (tone || '');
+      }
+
+      function renderChannelList() {
+        var list = document.getElementById('channel-list');
+        if (!list) return;
+        if (!channels.length) {
+          list.innerHTML = '<div class="muted">No channels configured yet.</div>';
+          return;
+        }
+        var html = channels.map(function (channel) {
+          var modeLabel = channel.mode === 'api' ? 'API send' : 'Open URL';
+          var toLine = channel.to ? ('<span class="muted">to: ' + escapeHtml(channel.to) + '</span>') : '<span class="muted">No provider destination set</span>';
+          return '<div class="channel-row">'
+            + '<strong>' + escapeHtml(channel.label) + '</strong>'
+            + '<a href="' + escapeHtml(channel.url) + '" target="_blank" rel="noopener">' + escapeHtml(channel.url) + '</a>'
+            + '<span class="muted">mode: ' + escapeHtml(modeLabel) + '</span>'
+            + toLine
+            + '<button class="btn btn-danger remove-channel" data-channel-id="' + escapeHtml(channel.id) + '">Remove</button>'
+            + '</div>';
+        }).join('');
+        list.innerHTML = html;
+      }
+
+      async function sendViaApi(channel, text) {
+        if (typeof window.whatsappSendMessage === 'function') {
+          return window.whatsappSendMessage({ to: channel.to, message: text, channel: channel });
+        }
+        return null;
+      }
+
+      function renderStories(prevSelections) {
+        var container = document.getElementById('stories');
+        if (!container) return;
+        var html = posts.map(function (post) {
+          var selected = prevSelections && prevSelections[String(post.id)] ? prevSelections[String(post.id)] : null;
+          var channelRows = channels.map(function (channel) {
+            var checked = selected ? selected.channels.has(channel.id) : true;
+            return '<label class="story-channel">'
+              + '<input type="checkbox" class="story-channel-check" value="' + escapeHtml(channel.id) + '" ' + (checked ? 'checked' : '') + '>'
+              + '<span>' + escapeHtml(channel.label) + '</span>'
+              + '</label>';
+          }).join('');
+
+          return '<article class="story" data-story-id="' + escapeHtml(post.id) + '">'
+            + '<h3>' + escapeHtml(post.index + '. ' + post.title) + '</h3>'
+            + '<pre id="story-text-' + escapeHtml(post.id) + '">' + escapeHtml(post.body) + '</pre>'
+            + '<label class="story-channel"><input type="checkbox" class="story-bulk-toggle" ' + ((selected ? selected.bulk : true) ? 'checked' : '') + '> Include in bulk send</label>'
+            + '<div class="story-channels">' + channelRows + '</div>'
+            + '<div class="story-actions">'
+            + '  <button class="btn btn-primary copy-story" data-story-id="' + escapeHtml(post.id) + '">Copy</button>'
+            + '  <button class="btn btn-secondary send-story" data-story-id="' + escapeHtml(post.id) + '">Send to selected channels</button>'
+            + '  <button class="btn btn-neutral select-story-channels" data-story-id="' + escapeHtml(post.id) + '">Select all channels</button>'
+            + '  <button class="btn btn-neutral clear-story-channels" data-story-id="' + escapeHtml(post.id) + '">Clear channels</button>'
+            + '</div>'
+            + '<div class="status" id="status-' + escapeHtml(post.id) + '"></div>'
+            + '</article>';
+        }).join('');
+        container.innerHTML = html;
+      }
+
+      function getSelectedChannelsForStory(storyId) {
+        var storyEl = document.querySelector('.story[data-story-id="' + CSS.escape(String(storyId)) + '"]');
+        if (!storyEl) return [];
+        var selectedIds = Array.from(storyEl.querySelectorAll('.story-channel-check:checked')).map(function (cb) {
+          return cb.value;
+        });
+        return channels.filter(function (channel) {
+          return selectedIds.includes(channel.id);
+        });
+      }
+
+      function getStoryText(storyId) {
+        return document.getElementById('story-text-' + storyId)?.textContent || '';
+      }
+
+      async function copyStory(storyId) {
+        var text = getStoryText(storyId);
+        if (!text.trim()) return;
+        await navigator.clipboard.writeText(text);
+        setStatus(storyId, 'Copied to clipboard.', 'ok');
+      }
+
+      async function sendStory(storyId, opts) {
+        var options = opts || {};
+        var selectedChannels = getSelectedChannelsForStory(storyId);
+        if (!selectedChannels.length) {
+          setStatus(storyId, 'No channels selected for this story.', 'error');
+          if (!options.silent) alert('No channels selected for this story.');
+          return false;
+        }
+
+        var text = getStoryText(storyId);
+        if (text.trim()) {
+          try { await navigator.clipboard.writeText(text); } catch (_err) {}
+        }
+
+        var okCount = 0;
+        var failCount = 0;
+        for (var i = 0; i < selectedChannels.length; i += 1) {
+          var channel = selectedChannels[i];
+          try {
+            if (channel.mode === 'api' && channel.to && isValidDestination(channel.to)) {
+              var apiResult = await sendViaApi(channel, text);
+              if (apiResult === null) {
+                var fallbackPopup = window.open(channel.url, '_blank', 'noopener');
+                if (!fallbackPopup) throw new Error('Popup blocked and API sender unavailable');
+              }
+            } else {
+              var popup = window.open(channel.url, '_blank', 'noopener');
+              if (!popup) throw new Error('Popup blocked');
+            }
+            okCount += 1;
+          } catch (err) {
+            failCount += 1;
+          }
+        }
+
+        var note = '';
+        if (okCount > 0 && failCount === 0) {
+          note = 'Sent/opened ' + okCount + ' channel' + (okCount === 1 ? '' : 's') + '. Message copied to clipboard.';
+          setStatus(storyId, note, 'ok');
+        } else if (okCount > 0 && failCount > 0) {
+          note = 'Processed ' + okCount + ' channel(s), ' + failCount + ' failed. Message copied to clipboard.';
+          setStatus(storyId, note, 'error');
+        } else {
+          note = 'No channels processed successfully. Message copied to clipboard.';
+          setStatus(storyId, note, 'error');
+        }
+        return true;
+      }
+
+      function setStoryChannelSelection(storyId, checked) {
+        var storyEl = document.querySelector('.story[data-story-id="' + CSS.escape(String(storyId)) + '"]');
+        if (!storyEl) return;
+        storyEl.querySelectorAll('.story-channel-check').forEach(function (input) {
+          input.checked = checked;
+        });
+        setStatus(storyId, '', '');
+      }
+
+      function setAllStoryChannels(checked) {
+        document.querySelectorAll('.story .story-channel-check').forEach(function (input) {
+          input.checked = checked;
+        });
+      }
+
+      async function sendBulkStories() {
+        var selectedStoryIds = Array.from(document.querySelectorAll('.story-bulk-toggle:checked')).map(function (toggle) {
+          return toggle.closest('.story')?.getAttribute('data-story-id');
+        }).filter(Boolean);
+
+        if (!selectedStoryIds.length) {
+          alert('No stories selected for bulk send.');
+          return;
+        }
+
+        var sent = 0;
+        var skipped = 0;
+        for (var i = 0; i < selectedStoryIds.length; i += 1) {
+          var ok = await sendStory(selectedStoryIds[i], { silent: true });
+          if (ok) sent += 1;
+          else skipped += 1;
+        }
+
+        if (skipped > 0) {
+          alert('Bulk send complete: ' + sent + ' sent, ' + skipped + ' skipped (missing channels).');
+        } else {
+          alert('Bulk send complete: ' + sent + ' stories sent.');
+        }
+      }
+
+      document.addEventListener('click', async function (event) {
+        var addBtn = event.target.closest('#add-channel');
+        if (addBtn) {
+          var labelInput = document.getElementById('channel-label');
+          var urlInput = document.getElementById('channel-url');
+          var toInput = document.getElementById('channel-to');
+          var modeInput = document.getElementById('channel-mode');
+          var label = String(labelInput?.value || '').trim();
+          var url = String(urlInput?.value || '').trim();
+          var to = String(toInput?.value || '').trim();
+          var mode = normalizeMode(modeInput?.value || 'open_url');
+          if (!label || !/^https?:\/\//i.test(url)) {
+            alert('Enter a channel label and a valid URL starting with http:// or https://');
+            return;
+          }
+          if (mode === 'api' && !isValidDestination(to)) {
+            alert('For API send mode, enter a valid destination like 1203...@g.us or 0029...@newsletter');
+            return;
+          }
+          var idBase = normalizeId(label);
+          var id = idBase;
+          var suffix = 1;
+          while (channels.some(function (channel) { return channel.id === id; })) {
+            suffix += 1;
+            id = idBase + '-' + suffix;
+          }
+          var prevSelections = getStorySelections();
+          channels.push({ id: id, label: label, url: url, to: to, mode: mode });
+          saveChannels();
+          renderChannelList();
+          renderStories(prevSelections);
+          if (labelInput) labelInput.value = '';
+          if (urlInput) urlInput.value = '';
+          if (toInput) toInput.value = '';
+          if (modeInput) modeInput.value = 'open_url';
+          return;
+        }
+
+        var removeBtn = event.target.closest('.remove-channel');
+        if (removeBtn) {
+          var removeId = removeBtn.getAttribute('data-channel-id');
+          var prev = getStorySelections();
+          channels = channels.filter(function (channel) { return channel.id !== removeId; });
+          saveChannels();
+          renderChannelList();
+          renderStories(prev);
+          return;
+        }
+
+        var copyBtn = event.target.closest('.copy-story');
+        if (copyBtn) {
+          var copyId = copyBtn.getAttribute('data-story-id');
+          try {
+            await copyStory(copyId);
+          } catch (_err) {
+            setStatus(copyId, 'Could not copy. Please copy manually.', 'error');
+          }
+          return;
+        }
+
+        var sendBtn = event.target.closest('.send-story');
+        if (sendBtn) {
+          var sendId = sendBtn.getAttribute('data-story-id');
+          await sendStory(sendId, { silent: false });
+          return;
+        }
+
+        var selectBtn = event.target.closest('.select-story-channels');
+        if (selectBtn) {
+          setStoryChannelSelection(selectBtn.getAttribute('data-story-id'), true);
+          return;
+        }
+
+        var clearBtn = event.target.closest('.clear-story-channels');
+        if (clearBtn) {
+          setStoryChannelSelection(clearBtn.getAttribute('data-story-id'), false);
+          return;
+        }
+
+        if (event.target.closest('#select-all-channels-all')) {
+          setAllStoryChannels(true);
+          return;
+        }
+
+        if (event.target.closest('#clear-all-channels-all')) {
+          setAllStoryChannels(false);
+          return;
+        }
+
+        if (event.target.closest('#send-selected-stories')) {
+          await sendBulkStories();
+        }
+      });
+
+      renderChannelList();
+      renderStories();
+    })();
+  </script>
+</body>
+</html>`;
+    },
+
     buildSocialHtml({ platform, posts, renderBody, renderActions }) {
         const rows = posts.map((post, idx) => {
             const body = renderBody(post);
@@ -1134,19 +1841,16 @@ const app = {
             platform: 'Reddit',
             posts: selected,
             renderBody: (post) => `${this.buildFirstSentence(post)}\n\n${post.link || ''}`,
-            renderActions: (post) => `<div class="actions"><a href="${this.buildRedditSubmitUrl(post)}" target="_blank">Open prefilled Reddit post</a></div>`,
+            renderActions: (post) => {
+                const flair = post.predicted_flair || '';
+                const flairBadge = flair
+                    ? `<span style="display:inline-block;background:#eef;padding:3px 8px;border-radius:4px;font-size:0.85rem;margin-right:8px;"><strong>Flair:</strong> ${this.escapeHtml(flair)}</span>`
+                    : `<span style="display:inline-block;background:#fff3cd;padding:3px 8px;border-radius:4px;font-size:0.85rem;margin-right:8px;">⚠ No flair mapped — select manually</span>`;
+                return `<div class="actions">${flairBadge}<a href="${this.buildRedditSubmitUrl(post)}" target="_blank">Open prefilled Reddit post</a></div>`;
+            },
         });
-        const xHtml = this.buildSocialHtml({
-            platform: 'X',
-            posts: selected,
-            renderBody: (post) => this.buildXText(post),
-            renderActions: (post) => `<div class="actions"><a href="${this.buildXIntentUrl(post)}" target="_blank">Open prefilled X post</a></div>`,
-        });
-        const whatsappHtml = this.buildSocialHtml({
-            platform: 'WhatsApp',
-            posts: selected,
-            renderBody: (post) => this.buildWhatsappText(post),
-        });
+        const xHtml = this.buildXSocialHtml(selected);
+        const whatsappHtml = this.buildWhatsappSocialHtml(selected);
 
         const redditUrl = this.createHtmlBlobUrl(redditHtml);
         const xUrl = this.createHtmlBlobUrl(xHtml);
@@ -1195,75 +1899,118 @@ const app = {
     },
 
     // ─── Step 4: Publish ─────────────────────────────────────────────
-    async publishAll() {
-        if (!confirm('This will create DRAFT posts in WordPress. Continue?')) return;
+    async publishAll({ confirmFirst = true, articlesOverride = null, fromGeneratePublish = false, retryOnly = false } = {}) {
+        if (this.state.isPublishing) return;
+        const articles = Array.isArray(articlesOverride) ? articlesOverride : Object.values(this.state.generatedArticles);
+        if (!articles.length) {
+            alert('No generated articles available to publish.');
+            return;
+        }
+        if (confirmFirst && !confirm('This will create DRAFT posts in WordPress. Continue?')) return;
 
+        this.state.isPublishing = true;
         this.setLoading('btn-publish-all', true);
-        const articles = Object.values(this.state.generatedArticles);
-        this.state.publishStartedAt = Date.now();
-        this.state.publishTotal = articles.length;
-        this.state.publishCompleted = 0;
-        this.state.publishDurationsMs = [];
-        this.updatePublishProgress('Starting publish...');
+        this.setLoading('btn-generate-publish', true);
+        this.setLoading('btn-generate-publish-review', true);
+        this.resetPublishState(articles.length);
+        this.updatePublishProgress(retryOnly ? 'Retrying failed publishes...' : 'Starting publish...');
         this.setPipelineStage('Publishing drafts to WordPress...', 92);
-        this.logEvent('info', 'publish', 'Publish flow started', { total: articles.length });
+        this.logEvent('info', 'publish', 'Publish flow started', { total: articles.length, retryOnly, fromGeneratePublish });
 
         for (const article of articles) {
             const startedAt = Date.now();
             try {
                 this.updatePublishProgress(`Publishing ${article.title}...`);
-                const res = await fetch(`${API_BASE}/publish-draft`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ article })
-                });
-
-                const raw = await res.text();
-                let data = {};
-                try {
-                    data = raw ? JSON.parse(raw) : {};
-                } catch {
-                    data = { error: raw || `HTTP ${res.status}` };
-                }
-
-                if (!res.ok) {
-                    throw new Error(data.error || `Publish request failed (${res.status})`);
-                }
-
-                if (data.error) throw new Error(data.error);
+                const { data, attempt } = await this.requestPublishDraftWithRetry(article);
                 this.mergeUsageDelta(data.usage || {});
+                this.state.publishSuccess += 1;
 
-                // Mark as published in UI
                 const statusDiv = document.getElementById(`proc-${article.cluster_id}`);
-                statusDiv.innerHTML = `
-          <span>🚀 Published Draft: <a href="${data.result.editLink}" target="_blank" style="color:inherit; text-decoration:underline;">Edit in WordPress</a></span>
-        `;
+                if (statusDiv) {
+                    statusDiv.className = 'status-bar success';
+                    statusDiv.innerHTML = `<span>🚀 Published Draft: <a href="${data.result.editLink}" target="_blank" style="color:inherit; text-decoration:underline;">Edit in WordPress</a></span>`;
+                }
+
                 this.logEvent('info', 'publish', 'Draft published', {
                     clusterId: article.cluster_id,
                     editLink: data.result.editLink,
                     usage: data.usage || {},
+                    attempt,
                 });
-
             } catch (err) {
+                this.state.publishFailed += 1;
+                const failure = {
+                    clusterId: article.cluster_id,
+                    title: article.title,
+                    article,
+                    reason: err.message,
+                    code: err.code || '',
+                    details: err.details || null,
+                    retryable: this.isRetryablePublishError(err),
+                    status: Number(err?.status || 0),
+                    attempts: Number(err?.attempt || PUBLISH_ATTEMPTS),
+                };
+                this.state.publishFailures = this.state.publishFailures.filter(item => item.clusterId !== article.cluster_id);
+                this.state.publishFailures.push(failure);
+
+                const statusDiv = document.getElementById(`proc-${article.cluster_id}`);
+                if (statusDiv) {
+                    statusDiv.className = 'status-bar error';
+                    const detailLine = failure.details
+                        ? ` [${this.escapeHtml(JSON.stringify(failure.details))}]`
+                        : '';
+                    statusDiv.innerHTML = `<span>❌ Publish failed: ${this.escapeHtml(article.title)} (${this.escapeHtml(err.message)}${detailLine})</span>`;
+                }
+
                 this.logEvent('error', 'publish', 'Draft publish failed', {
                     clusterId: article.cluster_id,
                     error: err.message,
+                    retryable: failure.retryable,
+                    status: failure.status,
                 });
-                alert(`Publish failed for "${article.title}": ${err.message}`);
             } finally {
                 this.state.publishCompleted += 1;
                 this.state.publishDurationsMs.push(Date.now() - startedAt);
-                this.updatePublishProgress('Publishing drafts...');
+                this.updatePublishProgress(retryOnly ? 'Retrying failed publishes...' : 'Publishing drafts...');
             }
         }
 
+        this.state.isPublishing = false;
         this.setLoading('btn-publish-all', false);
-        document.getElementById('btn-publish-all').innerText = 'All Done!';
+        this.setLoading('btn-generate-publish', false);
+        this.setLoading('btn-generate-publish-review', false);
         document.getElementById('btn-open-social').disabled = false;
-        this.updatePublishProgress('Publish complete');
-        this.setPipelineStage('Workflow complete.', 100);
+        const retryBtn = document.getElementById('btn-retry-failed-publish');
+        if (retryBtn) retryBtn.disabled = this.state.publishFailures.length === 0;
+
+        if (this.state.publishFailed > 0) {
+            this.updatePublishProgress('Publish finished with failures');
+            this.setPipelineStage('Publishing finished with failures. Retry failed drafts.', 96);
+            alert(`Publishing finished: ${this.state.publishSuccess} succeeded, ${this.state.publishFailed} failed.`);
+        } else {
+            this.updatePublishProgress('Publish complete');
+            this.setPipelineStage('Workflow complete.', 100);
+        }
+
         this.logEvent('info', 'publish', 'Publish flow complete', {
-            published: this.state.publishCompleted,
+            published: this.state.publishSuccess,
+            failed: this.state.publishFailed,
+            total: this.state.publishTotal,
+        });
+    },
+
+    async retryFailedPublishes() {
+        if (this.state.isPublishing) return;
+        const retryableFailures = this.state.publishFailures.filter(item => item.retryable !== false && item.article);
+        if (!retryableFailures.length) {
+            alert('No retryable failed publishes available.');
+            return;
+        }
+        const articles = retryableFailures.map(item => item.article);
+        await this.publishAll({
+            confirmFirst: false,
+            articlesOverride: articles,
+            retryOnly: true,
         });
     }
 };

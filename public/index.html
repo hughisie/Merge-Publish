@@ -130,6 +130,9 @@
       <div class="actions floating-actions review-actions">
         <div id="step2-selection-count" class="selection-count">Selected 0 of 0</div>
         <button class="btn-secondary" onclick="app.prevStep()">Back</button>
+        <button class="btn-primary" id="btn-generate-publish-review">
+          Generate + Publish Drafts
+        </button>
         <button class="btn-primary" id="btn-confirm-clusters">
           Generate Articles <span>&rarr;</span>
         </button>
@@ -140,6 +143,23 @@
     <div id="step-3" class="wizard-step">
       <h1>Generating Articles</h1>
       <p>Writing articles with Gemini, inserting links, and searching for images...</p>
+
+      <div class="publish-summary-card card" style="margin-top:0.75rem;">
+        <div class="generation-summary">
+          <div id="publish-overall-label">Ready to publish.</div>
+          <div id="publish-eta">ETA --:--</div>
+        </div>
+        <div class="progress-bar-bg generation-overall-progress" style="margin-bottom:0.6rem;">
+          <div id="publish-overall-progress" class="progress-bar-fill" style="width: 0%;"></div>
+        </div>
+        <div id="publish-outcome-summary" class="usage-summary">Published 0 / Total 0 · Failed 0</div>
+        <button type="button" class="btn-secondary" id="btn-retry-failed-publish" disabled>Retry failed publish</button>
+      </div>
+
+      <div class="card" style="margin-top:0.75rem;">
+        <div id="usage-summary" class="usage-summary">API calls 0 · In 0 tok · Out 0 tok · Est $0.0000</div>
+        <div id="usage-stage-breakdown" class="usage-stage-breakdown">No stage usage recorded yet.</div>
+      </div>
 
       <div class="generation-summary">
         <div id="generation-overall-label">Ready to generate.</div>
@@ -157,14 +177,6 @@
 
       <div id="generation-progress"></div>
 
-      <div class="generation-summary" style="margin-top:1rem;">
-        <div id="publish-overall-label">Ready to publish.</div>
-        <div id="publish-eta">ETA --:--</div>
-      </div>
-      <div class="progress-bar-bg generation-overall-progress">
-        <div id="publish-overall-progress" class="progress-bar-fill" style="width: 0%;"></div>
-      </div>
-
       <div id="preview-container"></div>
 
       <div id="admin-log-panel" class="card admin-only hidden">
@@ -172,12 +184,14 @@
           <h3 style="margin:0;">Admin Log</h3>
           <button type="button" id="btn-download-logs" class="btn-secondary">Download Logs</button>
         </div>
-        <div id="usage-summary" class="usage-summary">API calls 0 · In 0 tok · Out 0 tok · Est $0.0000</div>
         <div id="admin-log-list" class="admin-log-list"></div>
       </div>
 
       <div class="actions">
         <button class="btn-secondary" onclick="app.prevStep()">Back</button>
+        <button class="btn-primary" id="btn-generate-publish">
+          Generate + Publish Drafts
+        </button>
         <button class="btn-primary" id="btn-publish-all" disabled>
           Publish Drafts to WordPress
         </button>

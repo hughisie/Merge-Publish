@@ -197,7 +197,7 @@ export async function clusterStories(articles) {
         title: a.title || a.original_title,
         original_title: a.original_title || '',
         source: a.source_name || '',
-        snippet: (a.main_content_body || '').substring(0, 700),
+        snippet: (a.main_content_body || '').substring(0, 450),
         keywords: (a.keywords || []).slice(0, 12),
         normalized_title: normalizeTokens(a.title || a.original_title).slice(0, 12),
         date: a.date_time || '',
@@ -212,13 +212,13 @@ ${JSON.stringify(summaries, null, 2)}
 
 Return a JSON array of clusters. Each cluster should have:
 - "cluster_id": unique integer starting from 1
-- "merged_headline_en": a compelling English headline that covers the combined story
+- "merged_headline_en": a compelling English headline that covers the combined story (max 120 chars)
 - "article_indices": array of article index numbers that belong to this cluster
-- "story_summary_en": a 1-2 sentence English summary of what this story is about
+- "story_summary_en": one short sentence in English (max 160 chars)
 
-Return ONLY the JSON array, no other text.`;
+Return ONLY valid compact JSON (no markdown, no code fences, no commentary).`;
 
-    const clusters = await generateWithPro(prompt, { jsonMode: true });
+    const clusters = await generateWithPro(prompt, { jsonMode: true, stage: 'cluster_stories' });
     const learnedRules = await loadLearnedRules();
 
     // Build merged cluster objects

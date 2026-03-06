@@ -1,6 +1,12 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const projectRoot = path.resolve(__dirname, '..', '..');
+dotenv.config({ path: path.join(projectRoot, '.env'), override: true });
 
 
 const key = process.env.GEMINI_API_KEY?.trim();
@@ -8,6 +14,62 @@ if (!key) {
   console.error('❌ GEMINI_API_KEY is missing from environment variables!');
 } else {
   console.log(`📡 Gemini API Key loaded (starts with: ${key.substring(0, 6)}... ends with: ${key.substring(key.length - 4)})`);
+}
+
+/**
+ * Grounded search helper that hard-prefers Gemini 2.5 Flash.
+ * Used for auto-repair tasks where web-grounded URL recovery is required.
+ */
+export async function researchWithGroundingPreferred25(prompt, { stage = 'research_grounded_25' } = {}) {
+  const maxRetries = 3;
+  const preferred = 'gemini-2.5-flash';
+  const orderedCandidates = [
+    preferred,
+    activeFlashModelName,
+    ...FLASH_MODEL_CANDIDATES,
+  ].filter((value, index, arr) => value && arr.indexOf(value) === index);
+  let lastError = null;
+  const promptText = normalizePromptText(prompt);
+
+  for (const modelName of orderedCandidates) {
+    const flashModel = createFlashModel(modelName);
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const startedAt = Date.now();
+        const result = await flashModel.generateContent(prompt);
+        const response = result.response;
+        const text = response.text();
+
+        const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
+        const searchResults = groundingMetadata?.groundingChunks?.map(chunk => ({
+          title: chunk.web?.title || '',
+          url: chunk.web?.uri || '',
+        })) || [];
+
+        activeFlashModelName = modelName;
+        recordUsage({ modelName, stage, promptText, responseText: text, elapsedMs: Date.now() - startedAt });
+        return { text, searchResults, modelName };
+      } catch (err) {
+        lastError = err;
+        if (isModelNotFoundError(err)) {
+          console.warn(`⚠️ Gemini flash model unavailable: ${modelName}. Trying fallback...`);
+          break;
+        }
+        if (attempt < maxRetries - 1 && isRetryableStatusError(err)) {
+          await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+          continue;
+        }
+        if (isTransportError(err) || isServerError(err) || isRetryableStatusError(err)) {
+          console.warn(`⚠️ Gemini grounded call failed on ${modelName} (${err.message}). Trying fallback model...`);
+          break;
+        }
+        throw err;
+      }
+    }
+  }
+
+  const lastMessage = lastError?.message ? ` Last error: ${lastError.message}` : '';
+  throw new Error(`No compatible grounded Gemini flash model found. Tried: ${orderedCandidates.join(', ')}.${lastMessage}`);
 }
 
 function createPlainFlashModel(modelName) {
@@ -19,15 +81,17 @@ const genAI = new GoogleGenerativeAI(key);
 const PRO_MODEL_CANDIDATES = [
   process.env.GEMINI_PRO_MODEL?.trim(),
   'gemini-2.5-pro',
+  'gemini-2.5-pro-latest',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-latest',
   'gemini-2.0-flash',
-  'gemini-1.5-flash',
 ].filter(Boolean);
 
 const FLASH_MODEL_CANDIDATES = [
   process.env.GEMINI_FLASH_MODEL?.trim(),
   'gemini-2.5-flash',
+  'gemini-2.5-flash-latest',
   'gemini-2.0-flash',
-  'gemini-1.5-flash',
 ].filter(Boolean);
 
 const MODEL_PRICING = {
@@ -46,11 +110,29 @@ const usageState = {
     outputTokens: 0,
     estimatedCostUsd: 0,
     byStage: {},
+    byStageModels: {},
   },
 };
 
 let activeProModelName = PRO_MODEL_CANDIDATES[0];
 let activeFlashModelName = FLASH_MODEL_CANDIDATES[0];
+
+function getProCandidatesForStage(stage = '') {
+  const normalizedStage = String(stage || '').trim().toLowerCase();
+  const strictWriteCandidates = [
+    process.env.GEMINI_PRO_MODEL?.trim(),
+    'gemini-2.5-pro',
+    'gemini-2.5-pro-latest',
+  ].filter((value, index, arr) => value && arr.indexOf(value) === index);
+
+  if (normalizedStage === 'write_article') {
+    return strictWriteCandidates;
+  }
+
+  const baseline = [activeProModelName, ...PRO_MODEL_CANDIDATES]
+    .filter((value, index, arr) => value && arr.indexOf(value) === index);
+  return baseline;
+}
 
 function isModelNotFoundError(err) {
   const message = String(err?.message || '').toLowerCase();
@@ -113,6 +195,53 @@ function getModelPricing(modelName = '') {
   return MODEL_PRICING.default;
 }
 
+function sanitizeJsonText(rawText = '') {
+  const text = String(rawText || '').trim();
+  if (!text) return '';
+
+  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fencedMatch?.[1]) {
+    return fencedMatch[1].trim();
+  }
+
+  return text;
+}
+
+function extractLikelyJsonPayload(rawText = '') {
+  const text = sanitizeJsonText(rawText);
+  if (!text) return text;
+
+  const firstArray = text.indexOf('[');
+  const firstObject = text.indexOf('{');
+  const firstIndex = [firstArray, firstObject].filter(i => i >= 0).sort((a, b) => a - b)[0];
+  if (firstIndex == null) return text;
+
+  const lastArray = text.lastIndexOf(']');
+  const lastObject = text.lastIndexOf('}');
+  const lastIndex = Math.max(lastArray, lastObject);
+  if (lastIndex < firstIndex) return text;
+
+  return text.slice(firstIndex, lastIndex + 1).trim();
+}
+
+function parseModelJson(text = '') {
+  const attempts = [sanitizeJsonText(text), extractLikelyJsonPayload(text)];
+  let lastErr = null;
+
+  for (const candidate of attempts) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  const parseError = new Error(`Model returned invalid JSON: ${lastErr?.message || 'parse failed'}`);
+  parseError.code = 'INVALID_JSON_MODEL_OUTPUT';
+  throw parseError;
+}
+
 function recordUsage({ modelName, stage = 'unknown', promptText = '', responseText = '', elapsedMs = 0 }) {
   const inputTokens = estimateTokens(promptText);
   const outputTokens = estimateTokens(responseText);
@@ -148,6 +277,17 @@ function recordUsage({ modelName, stage = 'unknown', promptText = '', responseTe
   usageState.totals.byStage[stage].inputTokens += inputTokens;
   usageState.totals.byStage[stage].outputTokens += outputTokens;
   usageState.totals.byStage[stage].estimatedCostUsd += estimatedCostUsd;
+
+  if (!usageState.totals.byStageModels[stage]) {
+    usageState.totals.byStageModels[stage] = {};
+  }
+  if (!usageState.totals.byStageModels[stage][modelName]) {
+    usageState.totals.byStageModels[stage][modelName] = { calls: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 };
+  }
+  usageState.totals.byStageModels[stage][modelName].calls += 1;
+  usageState.totals.byStageModels[stage][modelName].inputTokens += inputTokens;
+  usageState.totals.byStageModels[stage][modelName].outputTokens += outputTokens;
+  usageState.totals.byStageModels[stage][modelName].estimatedCostUsd += estimatedCostUsd;
 }
 
 export function getUsageSnapshot() {
@@ -157,6 +297,7 @@ export function getUsageSnapshot() {
     outputTokens: usageState.totals.outputTokens,
     estimatedCostUsd: usageState.totals.estimatedCostUsd,
     byStage: JSON.parse(JSON.stringify(usageState.totals.byStage || {})),
+    byStageModels: JSON.parse(JSON.stringify(usageState.totals.byStageModels || {})),
   };
 }
 
@@ -167,6 +308,7 @@ export function diffUsageSnapshots(before = {}, after = {}) {
     outputTokens: Math.max(0, (after.outputTokens || 0) - (before.outputTokens || 0)),
     estimatedCostUsd: Math.max(0, (after.estimatedCostUsd || 0) - (before.estimatedCostUsd || 0)),
     byStage: {},
+    byStageModels: {},
   };
 
   const stages = new Set([
@@ -182,6 +324,27 @@ export function diffUsageSnapshots(before = {}, after = {}) {
     const estimatedCostUsd = Math.max(0, (a.estimatedCostUsd || 0) - (b.estimatedCostUsd || 0));
     if (calls || inputTokens || outputTokens || estimatedCostUsd) {
       delta.byStage[stage] = { calls, inputTokens, outputTokens, estimatedCostUsd };
+    }
+
+    const beforeModels = before.byStageModels?.[stage] || {};
+    const afterModels = after.byStageModels?.[stage] || {};
+    const models = new Set([...Object.keys(beforeModels), ...Object.keys(afterModels)]);
+    for (const modelName of models) {
+      const bModel = beforeModels[modelName] || {};
+      const aModel = afterModels[modelName] || {};
+      const mCalls = Math.max(0, (aModel.calls || 0) - (bModel.calls || 0));
+      const mInput = Math.max(0, (aModel.inputTokens || 0) - (bModel.inputTokens || 0));
+      const mOutput = Math.max(0, (aModel.outputTokens || 0) - (bModel.outputTokens || 0));
+      const mCost = Math.max(0, (aModel.estimatedCostUsd || 0) - (bModel.estimatedCostUsd || 0));
+      if (mCalls || mInput || mOutput || mCost) {
+        if (!delta.byStageModels[stage]) delta.byStageModels[stage] = {};
+        delta.byStageModels[stage][modelName] = {
+          calls: mCalls,
+          inputTokens: mInput,
+          outputTokens: mOutput,
+          estimatedCostUsd: mCost,
+        };
+      }
     }
   }
 
@@ -267,11 +430,19 @@ export async function generateWithFlash(prompt, { jsonMode = false, stage = 'gen
         activeFlashModelName = modelName;
         recordUsage({ modelName, stage, promptText, responseText: text, elapsedMs: Date.now() - startedAt });
         if (jsonMode) {
-          return JSON.parse(text);
+          return parseModelJson(text);
         }
         return text;
       } catch (err) {
         lastError = err;
+        if (jsonMode && err?.code === 'INVALID_JSON_MODEL_OUTPUT') {
+          if (attempt < maxRetries - 1) {
+            console.warn(`⚠️ Gemini flash returned malformed JSON on ${modelName}. Retrying...`);
+            continue;
+          }
+          console.warn(`⚠️ Gemini flash repeatedly returned malformed JSON on ${modelName}. Trying fallback model...`);
+          break;
+        }
         if (isModelNotFoundError(err)) {
           console.warn(`⚠️ Gemini flash model unavailable: ${modelName}. Trying fallback...`);
           break;
@@ -299,7 +470,7 @@ export async function generateWithFlash(prompt, { jsonMode = false, stage = 'gen
  */
 export async function generateWithPro(prompt, { jsonMode = false, stage = 'generate_pro' } = {}) {
   const maxRetries = 3;
-  const orderedCandidates = [activeProModelName, ...PRO_MODEL_CANDIDATES.filter(m => m !== activeProModelName)];
+  const orderedCandidates = getProCandidatesForStage(stage);
   let lastError = null;
   const promptText = normalizePromptText(prompt);
 
@@ -317,14 +488,24 @@ export async function generateWithPro(prompt, { jsonMode = false, stage = 'gener
           generationConfig: genConfig,
         });
         const text = result.response.text();
-        activeProModelName = modelName;
+        if (String(modelName).toLowerCase().includes('2.5-pro')) {
+          activeProModelName = modelName;
+        }
         recordUsage({ modelName, stage, promptText, responseText: text, elapsedMs: Date.now() - startedAt });
         if (jsonMode) {
-          return JSON.parse(text);
+          return parseModelJson(text);
         }
         return text;
       } catch (err) {
         lastError = err;
+        if (jsonMode && err?.code === 'INVALID_JSON_MODEL_OUTPUT') {
+          if (attempt < maxRetries - 1) {
+            console.warn(`⚠️ Gemini pro returned malformed JSON on ${modelName}. Retrying...`);
+            continue;
+          }
+          console.warn(`⚠️ Gemini pro repeatedly returned malformed JSON on ${modelName}. Trying fallback model...`);
+          break;
+        }
         if (isModelNotFoundError(err)) {
           console.warn(`⚠️ Gemini pro model unavailable: ${modelName}. Trying fallback...`);
           break;
@@ -342,6 +523,12 @@ export async function generateWithPro(prompt, { jsonMode = false, stage = 'gener
     }
   }
 
+  const normalizedStage = String(stage || '').trim().toLowerCase();
+  if (normalizedStage !== 'write_article') {
+    console.warn(`⚠️ Falling back to Gemini flash for stage "${stage}" after pro-model exhaustion.`);
+    return generateWithFlash(prompt, { jsonMode, stage: `${stage}_flash_fallback` });
+  }
+
   const lastMessage = lastError?.message ? ` Last error: ${lastError.message}` : '';
-  throw new Error(`No compatible Gemini pro model found. Tried: ${PRO_MODEL_CANDIDATES.join(', ')}.${lastMessage}`);
+  throw new Error(`No compatible Gemini pro model found. Tried: ${orderedCandidates.join(', ')}.${lastMessage}`);
 }

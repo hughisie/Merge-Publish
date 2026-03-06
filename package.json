@@ -3,8 +3,11 @@
   "version": "1.0.0",
   "description": "Merge JSON news articles and publish to WordPress",
   "type": "module",
+  "bin": {
+    "news-merger-publisher": "./bin/news-merger-publisher.js"
+  },
   "scripts": {
-    "dev": "nodemon server/index.js",
+    "dev": "nodemon --ignore 'data/*' server/index.js",
     "start": "node server/index.js"
   },
   "dependencies": {

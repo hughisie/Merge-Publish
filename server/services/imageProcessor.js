@@ -34,28 +34,65 @@ async function detectBanners(imageBuffer) {
     let topCrop = 0;
     let bottomCrop = 0;
 
-    // Check top strip
+    // First check for known solid-color banners (e.g., El Caso red, El Nacional yellow)
+    // We check the extreme bottom corners to bypass text/logos in the middle
     try {
-        const topStrip = await sharp(imageBuffer)
-            .extract({ left: 0, top: 0, width, height: stripHeight })
-            .stats();
-        // If all channels have very low standard deviation, it's likely a banner
-        const avgStdDev = topStrip.channels.reduce((sum, ch) => sum + ch.stdev, 0) / topStrip.channels.length;
-        if (avgStdDev < 15) {
-            topCrop = stripHeight;
+        const leftCorner = await sharp(imageBuffer)
+            .extract({ left: 5, top: height - 15, width: 5, height: 5 })
+            .raw()
+            .toBuffer();
+        const rightCorner = await sharp(imageBuffer)
+            .extract({ left: width - 10, top: height - 15, width: 5, height: 5 })
+            .raw()
+            .toBuffer();
+
+        const isColorMatch = (pixels, rMin, gMax, bMax, gMin = 0) => {
+            let r = 0, g = 0, b = 0;
+            for (let i = 0; i < pixels.length; i += 3) { r += pixels[i]; g += pixels[i + 1]; b += pixels[i + 2]; }
+            r /= (pixels.length / 3); g /= (pixels.length / 3); b /= (pixels.length / 3);
+            return (r > rMin && g > gMin && g < gMax && b < bMax);
+        };
+
+        const isRed = (pixels) => isColorMatch(pixels, 200, 80, 80, 0);       // El Caso
+        const isYellow = (pixels) => isColorMatch(pixels, 200, 255, 80, 180); // El Nacional
+
+        const leftRed = isRed(leftCorner);
+        const rightRed = isRed(rightCorner);
+        const leftYellow = isYellow(leftCorner);
+        const rightYellow = isYellow(rightCorner);
+
+        if ((leftRed && rightRed) || (leftYellow && rightYellow)) {
+            // Force a slightly larger crop to ensure we get the whole banner
+            const logoStripHeight = Math.floor(height * 0.15);
+            bottomCrop = logoStripHeight > 80 ? logoStripHeight : 80;
         }
     } catch (e) { /* ignore */ }
 
-    // Check bottom strip
-    try {
-        const bottomStrip = await sharp(imageBuffer)
-            .extract({ left: 0, top: height - stripHeight, width, height: stripHeight })
-            .stats();
-        const avgStdDev = bottomStrip.channels.reduce((sum, ch) => sum + ch.stdev, 0) / bottomStrip.channels.length;
-        if (avgStdDev < 15) {
-            bottomCrop = stripHeight;
-        }
-    } catch (e) { /* ignore */ }
+    // If no explicit logo banner found, fallback to standard deviation check
+    if (bottomCrop === 0) {
+        // Check top strip
+        try {
+            const topStrip = await sharp(imageBuffer)
+                .extract({ left: 0, top: 0, width, height: stripHeight })
+                .stats();
+            // If all channels have very low standard deviation, it's likely a banner
+            const avgStdDev = topStrip.channels.reduce((sum, ch) => sum + ch.stdev, 0) / topStrip.channels.length;
+            if (avgStdDev < 15) {
+                topCrop = stripHeight;
+            }
+        } catch (e) { /* ignore */ }
+
+        // Check bottom strip
+        try {
+            const bottomStrip = await sharp(imageBuffer)
+                .extract({ left: 0, top: height - stripHeight, width, height: stripHeight })
+                .stats();
+            const avgStdDev = bottomStrip.channels.reduce((sum, ch) => sum + ch.stdev, 0) / bottomStrip.channels.length;
+            if (avgStdDev < 15) {
+                bottomCrop = stripHeight;
+            }
+        } catch (e) { /* ignore */ }
+    }
 
     return { top: topCrop, bottom: bottomCrop };
 }
@@ -93,16 +130,22 @@ export async function processImages(imageUrls, { scoreImage } = {}) {
                 // Banner detection was too aggressive, use original
                 processedBuffer = buffer;
             } else if (cropTop > 0 || cropBottom > 0) {
-                processedBuffer = await sharp(buffer)
-                    .extract({
-                        left: 0,
-                        top: cropTop,
-                        width: metadata.width,
-                        height: newHeight,
-                    })
-                    .jpeg({ quality: 85 })
-                    .toBuffer();
-                console.log(`  ✂️  Cropped banners: top=${cropTop}px, bottom=${cropBottom}px`);
+                let croppedPipeline = sharp(buffer).extract({
+                    left: 0,
+                    top: cropTop,
+                    width: metadata.width,
+                    height: newHeight,
+                });
+
+                // If banner removal made the image too squat/low-res for a featured image, upscale slightly
+                if (newHeight < 550) {
+                    croppedPipeline = croppedPipeline.resize({ height: 600, width: null, withoutEnlargement: false });
+                    console.log(`  ✂️  Cropped banners and upscaled to h=600: top=${cropTop}px, bottom=${cropBottom}px`);
+                } else {
+                    console.log(`  ✂️  Cropped banners: top=${cropTop}px, bottom=${cropBottom}px`);
+                }
+
+                processedBuffer = await croppedPipeline.jpeg({ quality: 85 }).toBuffer();
             } else {
                 processedBuffer = await sharp(buffer)
                     .jpeg({ quality: 85 })

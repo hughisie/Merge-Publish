@@ -2,8 +2,12 @@ import fs from 'fs/promises';
 import path from 'path';
 import fetch from 'node-fetch';
 
-const ARCHIVE_ROOT = process.env.SOURCE_IMAGE_ARCHIVE_ROOT
-    || path.resolve(process.cwd(), 'data/source-image-archive');
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+const ARCHIVE_ROOT = process.env.GDRIVE_IMAGE_ARCHIVE_ROOT
+    || '/Users/m4owen/Library/CloudStorage/GoogleDrive-gunn0r@gmail.com/Shared drives/01.Player Clothing Team Drive/02. RetroShell/13. Articles and Data/10. Post Content';
+
+const ARCHIVE_PROFILE = process.env.GDRIVE_ARCHIVE_PROFILE || 'Default';
 
 function sanitizePathSegment(value = '', fallback = 'untitled') {
     const clean = String(value)
@@ -19,7 +23,9 @@ function toDateParts(date = new Date()) {
     const yyyy = String(d.getFullYear());
     const mm = String(d.getMonth() + 1).padStart(2, '0');
     const dd = String(d.getDate()).padStart(2, '0');
-    return { yyyy, mm, dd };
+    const monthName = MONTH_NAMES[d.getMonth()];
+    const monthDir = `${mm}. ${monthName}`;
+    return { yyyy, mm, dd, monthDir };
 }
 
 function guessExtension(url = '', contentType = '') {
@@ -50,13 +56,19 @@ async function downloadBinary(url) {
 export async function archiveSourceImages({ articleTitle = '', sourceImageUrls = [], date = new Date(), metadata = [] } = {}) {
     const urls = Array.from(new Set((sourceImageUrls || []).filter(Boolean)));
     if (urls.length === 0) {
-        return { archivedCount: 0, archiveDir: null, manifestPath: null, files: [] };
+        return { archivedCount: 0, archiveDir: null, files: [] };
     }
 
-    const { yyyy, mm, dd } = toDateParts(date);
-    const articleDir = sanitizePathSegment(articleTitle, 'untitled-article');
-    const archiveDir = path.join(ARCHIVE_ROOT, yyyy, mm, dd, articleDir, 'IMAGES');
-    await fs.mkdir(archiveDir, { recursive: true });
+    const { yyyy, dd, monthDir } = toDateParts(date);
+    const headline = sanitizePathSegment(articleTitle, 'untitled-article');
+    const archiveDir = path.join(ARCHIVE_ROOT, ARCHIVE_PROFILE, yyyy, monthDir, dd, headline);
+
+    try {
+        await fs.mkdir(archiveDir, { recursive: true });
+    } catch (err) {
+        console.warn(`  ⚠️  Could not create archive directory ${archiveDir}: ${err.message}`);
+        return { archivedCount: 0, archiveDir, files: [] };
+    }
 
     const files = [];
     for (let i = 0; i < urls.length; i += 1) {
@@ -64,35 +76,20 @@ export async function archiveSourceImages({ articleTitle = '', sourceImageUrls =
         try {
             const { buffer, contentType } = await downloadBinary(url);
             const extension = guessExtension(url, contentType);
-            const fileName = `${String(i + 1).padStart(2, '0')}.${extension}`;
+            const fileName = `Image${i + 1}.${extension}`;
             const absolutePath = path.join(archiveDir, fileName);
             await fs.writeFile(absolutePath, buffer);
 
-            const metaMatch = metadata.find(item => item?.originalUrl === url) || {};
-            files.push({
-                url,
-                fileName,
-                absolutePath,
-                relevanceScore: Number.isFinite(metaMatch?.relevanceScore) ? metaMatch.relevanceScore : null,
-                selected: Boolean(metaMatch?.selected),
-            });
+            files.push({ url, fileName, absolutePath });
         } catch (err) {
             files.push({ url, error: err.message });
         }
     }
 
-    const manifestPath = path.join(archiveDir, 'images.json');
-    await fs.writeFile(manifestPath, JSON.stringify({
-        articleTitle,
-        archiveDir,
-        createdAt: new Date().toISOString(),
-        files,
-    }, null, 2));
+    const archivedCount = files.filter(f => !f.error).length;
+    if (archivedCount > 0) {
+        console.log(`  📁 Archived ${archivedCount} image(s) → ${archiveDir}`);
+    }
 
-    return {
-        archivedCount: files.filter(file => !file.error).length,
-        archiveDir,
-        manifestPath,
-        files,
-    };
+    return { archivedCount, archiveDir, files };
 }

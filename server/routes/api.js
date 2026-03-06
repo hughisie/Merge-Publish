@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { mkdir, writeFile } from 'fs/promises';
+import { fileURLToPath } from 'url';
 import { readArticlesFromDirectory } from '../services/fileReader.js';
 import { clusterStories, learnForceMerge } from '../services/storyClusterer.js';
 import { checkDuplicates } from '../services/duplicateChecker.js';
@@ -10,6 +11,31 @@ import { publishDraft, getCategories, getAuthors, backfillDraftSeoMeta, getRecen
 import { generateWithFlash, getUsageSnapshot, diffUsageSnapshots } from '../services/llmClient.js';
 
 const router = express.Router();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const projectRoot = path.resolve(__dirname, '..', '..');
+
+function isTransportError(err) {
+    const message = String(err?.message || '').toLowerCase();
+    const causeCode = String(err?.cause?.code || '').toLowerCase();
+    return (
+        message.includes('fetch failed') ||
+        message.includes('network') ||
+        message.includes('socket hang up') ||
+        causeCode.includes('econnreset') ||
+        causeCode.includes('enotfound') ||
+        causeCode.includes('etimedout')
+    );
+}
+
+function isRetryablePublishError(err) {
+    if (err?.retryable === true) return true;
+    const status = Number(err?.status || 0);
+    if (isTransportError(err)) return true;
+    if (status === 408 || status === 429) return true;
+    if (status >= 500) return true;
+    return false;
+}
 
 async function scoreImageRelevance(image, article) {
     const prompt = `Score how relevant this image is to the article. Return JSON only.
@@ -39,6 +65,17 @@ async function generateArticleSafe(cluster) {
     const startedAt = Date.now();
     try {
         const article = await generateArticle(cluster);
+
+        try {
+            const backupDir = path.join(projectRoot, 'data', 'generated_drafts_backup');
+            await mkdir(backupDir, { recursive: true });
+            const backupPath = path.join(backupDir, `${Date.now()}_cluster_${cluster?.cluster_id || 'unknown'}.json`);
+            await writeFile(backupPath, JSON.stringify(article, null, 2), 'utf8');
+            console.log(`💾 Saved draft backup to ${backupPath}`);
+        } catch (backupErr) {
+            console.error('⚠️ Failed to save article backup:', backupErr);
+        }
+
         const afterUsage = getUsageSnapshot();
         return {
             ok: true,
@@ -213,7 +250,15 @@ router.post('/publish-draft', async (req, res) => {
         res.json({ result, usage: diffUsageSnapshots(beforeUsage, afterUsage) });
     } catch (err) {
         console.error('Publish error:', err);
-        res.status(500).json({ error: err.message });
+        const retryable = isRetryablePublishError(err);
+        const status = Number(err?.status || 0);
+        const responseStatus = status >= 400 && status < 500 && !retryable ? status : 500;
+        res.status(responseStatus).json({
+            error: err.message,
+            retryable,
+            code: err?.code || (retryable ? 'publish_transient_failure' : 'publish_failed'),
+            details: err?.details || null,
+        });
     }
 });
 

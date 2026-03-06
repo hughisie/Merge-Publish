@@ -25,7 +25,7 @@ app.get('*', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`
 ╔══════════════════════════════════════════════╗
 ║   📰  News Merger & Publisher               ║
@@ -42,3 +42,8 @@ app.listen(PORT, () => {
         console.warn('⚠️  WP_USER and/or WP_APP_PASSWORD not set. WordPress publishing will fail.');
     }
 });
+
+// Increase timeout significantly for long-running LLM and image tasks
+server.setTimeout(15 * 60 * 1000); // 15 minutes
+server.keepAliveTimeout = 15 * 60 * 1000;
+server.headersTimeout = 15 * 60 * 1000 + 1000;
