@@ -7,7 +7,7 @@ import apiRoutes from './routes/api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8011;
 
 // Middleware
 app.use(cors());
@@ -41,6 +41,15 @@ const server = app.listen(PORT, () => {
     if (!process.env.WP_USER || !process.env.WP_APP_PASSWORD) {
         console.warn('⚠️  WP_USER and/or WP_APP_PASSWORD not set. WordPress publishing will fail.');
     }
+});
+
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`❌ Port ${PORT} is already in use. Stop the other process or set a different PORT in .env.`);
+        process.exit(1);
+    }
+    console.error('❌ Server failed to start:', err);
+    process.exit(1);
 });
 
 // Increase timeout significantly for long-running LLM and image tasks

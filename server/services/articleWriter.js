@@ -805,15 +805,15 @@ Return a JSON object with:
 export async function generateArticle(cluster) {
     console.log(`📝 Generating article: ${cluster.headline}`);
 
-    // Step 1: Research
+    // Step 1 + 2: Independent enrichment in parallel
     console.log('  🔍 Researching topic with grounding...');
-    const research = await researchTopic(cluster);
-
-    // Step 2: Find related Barna.News articles
     console.log('  🔗 Finding related Barna.News articles...');
-    const relatedArticles = await findRelatedArticles(cluster.headline, cluster.keywords, {
-        context: cluster.summary || cluster.merged_content || '',
-    });
+    const [research, relatedArticles] = await Promise.all([
+        researchTopic(cluster),
+        findRelatedArticles(cluster.headline, cluster.keywords, {
+            context: cluster.summary || cluster.merged_content || '',
+        }),
+    ]);
 
     // Step 3: Write the article
     console.log('  ✍️  Writing article with Gemini Pro...');
@@ -838,12 +838,15 @@ export async function generateArticle(cluster) {
             ...(cluster.sources || []),
         ],
     };
-    article.body_html = ensurePrimarySourceLink(article.body_html || '', primarySourceCluster, research);
-    article.body_html = await enforceArticleLinkPolicy(article.body_html || '', {
-        relatedArticles,
-        research,
-        context: `${cluster.headline || ''}\n${cluster.summary || ''}`,
-    });
+    const bodyBeforePrimarySource = article.body_html || '';
+    article.body_html = ensurePrimarySourceLink(bodyBeforePrimarySource, primarySourceCluster, research);
+    if (article.body_html !== bodyBeforePrimarySource) {
+        article.body_html = await enforceArticleLinkPolicy(article.body_html || '', {
+            relatedArticles,
+            research,
+            context: `${cluster.headline || ''}\n${cluster.summary || ''}`,
+        });
+    }
 
     // Step 4: Insert WhatsApp banner after first paragraph
     if (article.body_html) {

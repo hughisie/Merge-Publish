@@ -7,8 +7,10 @@
     "news-merger-publisher": "./bin/news-merger-publisher.js"
   },
   "scripts": {
-    "dev": "nodemon --ignore 'data/*' server/index.js",
-    "start": "node server/index.js"
+    "dev": "nodemon --watch server --watch public --ext js,mjs,cjs,json,html --ignore 'data/**' --ignore 'node_modules/**' server/index.js",
+    "start": "node server/index.js",
+    "recover:failed-publishes": "node scripts/recover-failed-publishes.js",
+    "backfill:draft-images": "node scripts/backfill-draft-images.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.0",

@@ -1,4 +1,4 @@
-import { generateWithPro } from './llmClient.js';
+import { generateWithFlash } from './llmClient.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -218,7 +218,7 @@ Return a JSON array of clusters. Each cluster should have:
 
 Return ONLY valid compact JSON (no markdown, no code fences, no commentary).`;
 
-    const clusters = await generateWithPro(prompt, { jsonMode: true, stage: 'cluster_stories' });
+    const clusters = await generateWithFlash(prompt, { jsonMode: true, stage: 'cluster_stories' });
     const learnedRules = await loadLearnedRules();
 
     // Build merged cluster objects

@@ -199,7 +199,7 @@ function ensureMinimumLinks(html = '', candidates = [], minimum = 3, maximum = 4
         const safeUrl = String(item?.url || '').trim();
         const safeTitle = escapeHtml(item?.title || 'Related source');
         if (!safeUrl || existing.has(safeUrl)) continue;
-        additions.push(`<p>Further context: <a href="${safeUrl}" target="_blank" rel="nofollow noopener noreferrer" data-protected="true">${safeTitle}</a>.</p>`);
+        additions.push(`<p>Further context: <a href="${safeUrl}" target="_blank" rel="nofollow noopener noreferrer">${safeTitle}</a>.</p>`);
         existing.add(safeUrl);
         count += 1;
     }
@@ -208,6 +208,50 @@ function ensureMinimumLinks(html = '', candidates = [], minimum = 3, maximum = 4
         out = `${out}\n\n<h2>Further Resources</h2>\n${additions.join('\n')}`;
     }
     return trimAnchorsToMax(out, maximum);
+}
+
+async function aiRepairPublishBody(article = {}, publishValidation = {}) {
+    const currentBody = String(article?.body_html || '').slice(0, 16000);
+    const candidates = collectPublishLinkCandidates(article)
+        .slice(0, 10)
+        .map((item) => ({
+            title: String(item?.title || '').slice(0, 180),
+            url: String(item?.url || '').slice(0, 600),
+        }));
+
+    const prompt = `You repair WordPress article HTML for strict publish validation. Return JSON only.
+
+Input:
+- title: ${JSON.stringify(String(article?.title || '').slice(0, 240))}
+- focus_keyphrase: ${JSON.stringify(String(article?.focus_keyphrase || '').slice(0, 120))}
+- failed_validation: ${JSON.stringify(publishValidation || {})}
+- link_candidates: ${JSON.stringify(candidates)}
+- body_html: ${JSON.stringify(currentBody)}
+
+Validation targets:
+1) Body must contain 2-4 normal <a href="https://...">...</a> links (do not use data-protected).
+2) At most 1 link per <p> paragraph.
+3) No broken <blockquote>.
+4) Keep "Related Reading on Barna.News" section as a valid <h2> followed by <ul> with linked <li> items when present.
+5) Preserve meaning and facts; do not invent claims.
+6) Output standard HTML tags only (<p>, <h2>, <h3>, <blockquote>, <ul>, <li>, <a>, <em>, <strong>, <hr>).
+7) Never output Gutenberg comments.
+
+Output schema:
+{
+  "body_html": "string",
+  "changes": ["string"]
+}`;
+
+    try {
+        const response = await generateWithFlash(prompt, { jsonMode: true, stage: 'publish_self_repair' });
+        const repaired = String(response?.body_html || '').trim();
+        if (!repaired) return null;
+        return repaired;
+    } catch (err) {
+        console.warn(`  ⚠️  AI publish-body repair unavailable: ${err.message}`);
+        return null;
+    }
 }
 
 function enforcePublishBodyRules(html = '', article = {}) {
@@ -394,19 +438,59 @@ function sanitizeQuoteBlock(raw = '') {
     return `<blockquote class="wp-block-quote">${cleaned}</blockquote>`;
 }
 
+function htmlToPlainText(html = '') {
+    return normalizeWhitespace(String(html || '').replace(/<[^>]+>/g, ' '));
+}
+
+function buildSubheadingFromParagraph(paragraphHtml = '', focus = '') {
+    const paragraphText = htmlToPlainText(paragraphHtml);
+    if (!paragraphText) return '';
+
+    const headingStopWords = new Set([
+        'the', 'a', 'an', 'and', 'or', 'but', 'for', 'nor', 'yet', 'so',
+        'to', 'of', 'in', 'on', 'at', 'by', 'with', 'from', 'into', 'about', 'over',
+        'after', 'before', 'between', 'during', 'without', 'under', 'within', 'across',
+        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'that', 'this', 'these', 'those',
+    ]);
+
+    const focusWords = tokenizeForKeyphrase(focus)
+        .map(word => word.toLowerCase())
+        .filter(word => word.length > 2 && !headingStopWords.has(word));
+    const paragraphWords = tokenizeForKeyphrase(paragraphText)
+        .map(word => word.toLowerCase())
+        .filter(word => word.length > 2 && !headingStopWords.has(word));
+
+    const picked = uniqueTerms([...focusWords, ...paragraphWords]).slice(0, 6);
+    if (picked.length < 2) return '';
+    return toTitleCaseWords(picked).slice(0, 70);
+}
+
+function isSubheadingRelevant(heading = '', context = '') {
+    const headingTokens = tokenizeForKeyphrase(heading)
+        .map(token => token.toLowerCase())
+        .filter(token => token.length > 2);
+    if (!headingTokens.length) return false;
+
+    const contextTokens = new Set(
+        tokenizeForKeyphrase(context)
+            .map(token => token.toLowerCase())
+            .filter(token => token.length > 2)
+    );
+    if (!contextTokens.size) return false;
+
+    const overlap = headingTokens.filter(token => contextTokens.has(token)).length;
+    return overlap / headingTokens.length >= 0.45;
+}
+
 function ensureSubheadingDistribution(html = '', focus = '') {
     const input = String(html || '');
     if (!input || /<h2[\s>]/i.test(input)) return input;
     const paragraphs = input.match(/<p[\s\S]*?<\/p>/gi) || [];
     if (paragraphs.length < 6) return input;
 
-    const labels = [
-        'What Happened',
-        'Why It Matters',
-        `${normalizeTitleCase(focus || 'What Happens Next')}`.slice(0, 60),
-    ];
+    const contextText = `${normalizeWhitespace(String(focus || ''))} ${htmlToPlainText(input)}`.trim();
+    let insertedCount = 0;
     let cursor = 0;
-    let labelIndex = 0;
     let rebuilt = '';
 
     for (let i = 0; i < paragraphs.length; i++) {
@@ -415,9 +499,15 @@ function ensureSubheadingDistribution(html = '', focus = '') {
         if (idx === -1) continue;
         const between = input.slice(cursor, idx);
         rebuilt += between;
-        if (i > 0 && i % 3 === 0 && labelIndex < labels.length) {
-            rebuilt += `<h2>${labels[labelIndex++]}</h2>`;
+
+        if (i > 0 && i % 3 === 0 && insertedCount < 3) {
+            const candidate = buildSubheadingFromParagraph(p, focus);
+            if (candidate && isSubheadingRelevant(candidate, contextText)) {
+                rebuilt += `<h2>${escapeHtml(candidate)}</h2>`;
+                insertedCount += 1;
+            }
         }
+
         rebuilt += p;
         cursor = idx + p.length;
     }
@@ -1483,6 +1573,20 @@ export async function publishDraft(article, imageData) {
             research: finalArticle.research || article.research || {},
         });
         publishValidation = validatePublishBodyRules(finalArticle.body_html || '');
+    }
+    if (!publishValidation.valid) {
+        const aiRepairedBody = await aiRepairPublishBody(finalArticle, publishValidation);
+        if (aiRepairedBody) {
+            finalArticle.body_html = enforcePublishBodyRules(aiRepairedBody, {
+                ...finalArticle,
+                relatedArticles: finalArticle.relatedArticles || article.relatedArticles || [],
+                research: finalArticle.research || article.research || {},
+            });
+            publishValidation = validatePublishBodyRules(finalArticle.body_html || '');
+            if (publishValidation.valid) {
+                console.log('  🤖 Publish self-repair recovered validation');
+            }
+        }
     }
     if (!publishValidation.valid) {
         const err = new Error(`Article failed publish validation: ${JSON.stringify(publishValidation)}`);
