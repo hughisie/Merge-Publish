@@ -70,7 +70,16 @@ async function generateArticleSafe(cluster) {
             const backupDir = path.join(projectRoot, 'data', 'generated_drafts_backup');
             await mkdir(backupDir, { recursive: true });
             const backupPath = path.join(backupDir, `${Date.now()}_cluster_${cluster?.cluster_id || 'unknown'}.json`);
-            await writeFile(backupPath, JSON.stringify(article, null, 2), 'utf8');
+            const backupPayload = {
+                ...article,
+                _backup: {
+                    saved_at: new Date().toISOString(),
+                    cluster_id: cluster?.cluster_id ?? null,
+                    cluster_headline: cluster?.headline || '',
+                    cluster_summary: cluster?.summary || '',
+                },
+            };
+            await writeFile(backupPath, JSON.stringify(backupPayload, null, 2), 'utf8');
             console.log(`💾 Saved draft backup to ${backupPath}`);
         } catch (backupErr) {
             console.error('⚠️ Failed to save article backup:', backupErr);

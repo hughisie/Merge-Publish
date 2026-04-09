@@ -6,7 +6,17 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '..', '..');
+const runtimePort = process.env.PORT;
+const runtimeGeminiKey = process.env.GEMINI_API_KEY;
 dotenv.config({ path: path.join(projectRoot, '.env'), override: true });
+if (typeof runtimePort === 'undefined') {
+  delete process.env.PORT;
+} else {
+  process.env.PORT = runtimePort;
+}
+if (runtimeGeminiKey && runtimeGeminiKey !== process.env.GEMINI_API_KEY) {
+  console.warn('⚠️ Overriding inherited GEMINI_API_KEY with .env value.');
+}
 
 
 const key = process.env.GEMINI_API_KEY?.trim();

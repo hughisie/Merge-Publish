@@ -1,7 +1,16 @@
 const API_BASE = '/api';
 const STORY_TYPES = ['news', 'feature', 'interview', 'opinion', 'review', 'recommendation', 'whats_on', 'history', 'other'];
-const GENERATION_CONCURRENCY = 2;
+function resolveGenerationConcurrency() {
+    const params = new URLSearchParams(window.location.search);
+    const fromQuery = Number(params.get('concurrency'));
+    const fromStorage = Number(localStorage.getItem('generation-concurrency'));
+    const candidate = Number.isFinite(fromQuery) && fromQuery > 0 ? fromQuery : fromStorage;
+    return Math.max(1, Math.min(6, Number.isFinite(candidate) && candidate > 0 ? Math.floor(candidate) : 3));
+}
+
+const GENERATION_CONCURRENCY = resolveGenerationConcurrency();
 const GENERATION_ETA_WINDOW = 5;
+const ARTICLE_REQUEST_TIMEOUT_MS = 12 * 60 * 1000;
 const PUBLISH_ATTEMPTS = 2;
 const PUBLISH_RETRY_BASE_DELAY_MS = 800;
 const DEFAULT_WHATSAPP_CHANNELS = [
@@ -80,6 +89,8 @@ const app = {
 
     bindEvents() {
         document.getElementById('btn-load-dir').addEventListener('click', () => this.loadDirectory());
+        document.getElementById('btn-top-load')?.addEventListener('click', () => this.goToStep(1));
+        document.getElementById('btn-reset-workflow')?.addEventListener('click', () => this.resetWorkflowState());
 
         // File picker events
         if (document.getElementById('btn-browse')) {
@@ -461,6 +472,100 @@ const app = {
         this.renderPublishOutcomeSummary();
     },
 
+    resetWorkflowState() {
+        this.stopGenerationTimer();
+
+        this.state.currentStep = 1;
+        this.state.directoryPath = '';
+        this.state.articles = [];
+        this.state.clusters = [];
+        this.state.selectedStoryTypes = [...STORY_TYPES];
+        this.state.clusterSort = 'date_desc';
+        this.state.selectedClusterIds = new Set();
+        this.state.generatedArticles = {};
+        this.state.recentPosts = [];
+        this.state.selectedSocialPostIds = new Set();
+        this.state.editorDrafts = {};
+        this.state.previewingClusterId = null;
+        this.state.operationLogs = [];
+        this.state.publishStartedAt = null;
+        this.state.publishTotal = 0;
+        this.state.publishCompleted = 0;
+        this.state.publishSuccess = 0;
+        this.state.publishFailed = 0;
+        this.state.publishFailures = [];
+        this.state.isPublishing = false;
+        this.state.autoPublishAfterGeneration = false;
+        this.state.generationTimerInterval = null;
+        this.state.generationStartedAt = null;
+        this.state.generationTotal = 0;
+        this.state.generationCompleted = 0;
+        this.state.generationDurationsMs = [];
+        this.state.generationFailed = [];
+        this.state.publishDurationsMs = [];
+        this.state.usageTotals = {
+            calls: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            estimatedCostUsd: 0,
+            byStage: {},
+            byStageModels: {},
+        };
+
+        const dirPathEl = document.getElementById('dir-path');
+        const dirPickerEl = document.getElementById('dir-picker');
+        const fileStatsEl = document.getElementById('file-stats');
+        const clustersEl = document.getElementById('clusters-container');
+        const generationEl = document.getElementById('generation-progress');
+        const previewEl = document.getElementById('preview-container');
+        const postsEl = document.getElementById('recent-posts-container');
+        const socialResultEl = document.getElementById('social-files-result');
+        const loadingContainerEl = document.getElementById('loading-progress-container');
+        const loadingBarEl = document.getElementById('loading-progress');
+        const loadingStatusEl = document.getElementById('loading-status');
+        const sortEl = document.getElementById('sort-story-clusters');
+
+        if (dirPathEl) dirPathEl.value = '';
+        if (dirPickerEl) dirPickerEl.value = '';
+        if (fileStatsEl) {
+            fileStatsEl.innerHTML = '';
+            fileStatsEl.classList.add('hidden');
+        }
+        if (clustersEl) clustersEl.innerHTML = '';
+        if (generationEl) generationEl.innerHTML = '';
+        if (previewEl) previewEl.innerHTML = '';
+        if (postsEl) postsEl.innerHTML = '<p>No recent posts loaded yet.</p>';
+        if (socialResultEl) {
+            socialResultEl.innerHTML = '';
+            socialResultEl.classList.add('hidden');
+        }
+        if (loadingContainerEl) loadingContainerEl.classList.add('hidden');
+        if (loadingBarEl) loadingBarEl.style.width = '0%';
+        if (loadingStatusEl) loadingStatusEl.innerText = 'Reading files...';
+        if (sortEl) sortEl.value = 'date_desc';
+
+        document.querySelectorAll('.type-filter-check').forEach((check) => { check.checked = true; });
+        const retryGenBtn = document.getElementById('btn-retry-failed');
+        const retryPublishBtn = document.getElementById('btn-retry-failed-publish');
+        const publishBtn = document.getElementById('btn-publish-all');
+        if (retryGenBtn) retryGenBtn.disabled = true;
+        if (retryPublishBtn) retryPublishBtn.disabled = true;
+        if (publishBtn) publishBtn.disabled = true;
+
+        this.goToStep(1);
+        this.setPipelineStage('Ready', 0);
+        this.updateTypeFilterLabel();
+        this.updateSelectionCounters();
+        this.renderUsageSummary();
+        this.updateGenerationProgress('Ready to generate.');
+        this.renderPublishOutcomeSummary();
+        this.updatePublishProgress('Ready to publish.');
+        this.renderAdminLogs();
+        this.logEvent('info', 'ui', 'Workflow reset');
+
+        if (dirPathEl) dirPathEl.focus();
+    },
+
     async requestPublishDraftWithRetry(article, { maxAttempts = PUBLISH_ATTEMPTS } = {}) {
         let lastError = null;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -539,19 +644,31 @@ const app = {
     },
 
     async requestWriteArticle(cluster) {
-        const response = await fetch(`${API_BASE}/write-article-safe`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cluster }),
-        });
-        const payload = await response.json();
-        if (!response.ok || !payload?.ok || payload?.error) {
-            const message = payload?.error?.message || payload?.error || `HTTP ${response.status}`;
-            const error = new Error(message);
-            error.payload = payload;
-            throw error;
+        const controller = new AbortController();
+        const timeoutHandle = setTimeout(() => controller.abort(), ARTICLE_REQUEST_TIMEOUT_MS);
+        try {
+            const response = await fetch(`${API_BASE}/write-article-safe`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cluster }),
+                signal: controller.signal,
+            });
+            const payload = await response.json();
+            if (!response.ok || !payload?.ok || payload?.error) {
+                const message = payload?.error?.message || payload?.error || `HTTP ${response.status}`;
+                const error = new Error(message);
+                error.payload = payload;
+                throw error;
+            }
+            return payload;
+        } catch (err) {
+            if (err?.name === 'AbortError') {
+                throw new Error(`Generation timed out after ${Math.round(ARTICLE_REQUEST_TIMEOUT_MS / 60000)} minutes`);
+            }
+            throw err;
+        } finally {
+            clearTimeout(timeoutHandle);
         }
-        return payload;
     },
 
     async processGenerationCluster(cluster, { retryAttempt = 0 } = {}) {

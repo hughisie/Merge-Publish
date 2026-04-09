@@ -1,5 +1,5 @@
 import fetch from 'node-fetch';
-import { generateWithPro } from './llmClient.js';
+import { generateWithFlash } from './llmClient.js';
 
 const WP_URL = () => process.env.WP_URL || 'https://barna.news';
 
@@ -76,7 +76,7 @@ Return a JSON array with one object per cluster:
 
 Return ONLY the JSON array.`;
 
-    const results = await generateWithPro(prompt, { jsonMode: true });
+    const results = await generateWithFlash(prompt, { jsonMode: true, stage: 'duplicate_check' });
 
     // Apply duplicate flags
     for (const result of results) {
